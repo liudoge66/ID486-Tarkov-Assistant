@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.spec
+*.exe
+*.zip
+settings.json
+monitor_events.jsonl
+diagnostics/
+*.mp4
+*.mp3
+*.log
+offline_validation.csv
