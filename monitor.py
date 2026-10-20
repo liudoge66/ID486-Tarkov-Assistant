@@ -13,7 +13,7 @@ import winsound
 from collections import deque
 from detector import Detector, Gate, ExtractionGuard
 from diagnostics import Diagnostics
-APP_BUILD='2026.10.18-extraction-digits-v2'
+APP_BUILD='2026.10.21-v0.1.3-exit-observation'
 
 U=C.WinDLL('user32',use_last_error=True)
 K=C.WinDLL('kernel32',use_last_error=True)
@@ -24,6 +24,7 @@ U.ClientToScreen.argtypes=[W.HWND,C.POINTER(W.POINT)]
 K.OpenProcess.argtypes=[W.DWORD,W.BOOL,W.DWORD];K.OpenProcess.restype=W.HANDLE
 K.QueryFullProcessImageNameW.argtypes=[W.HANDLE,W.DWORD,W.LPWSTR,C.POINTER(W.DWORD)]
 K.CloseHandle.argtypes=[W.HANDLE]
+K.WaitForSingleObject.argtypes=[W.HANDLE,W.DWORD];K.WaitForSingleObject.restype=W.DWORD
 K.CreateMutexW.argtypes=[C.c_void_p,W.BOOL,W.LPCWSTR];K.CreateMutexW.restype=W.HANDLE
 U.RegisterHotKey.argtypes=[W.HWND,C.c_int,W.UINT,W.UINT]
 U.PeekMessageW.argtypes=[C.POINTER(W.MSG),W.HWND,W.UINT,W.UINT,W.UINT]
@@ -150,17 +151,25 @@ def target():
     if (origin.x,origin.y,rect.right,rect.bottom)!=(0,0,width,height):return None
     return (int(hwnd),int(pid.value),width,height)
 
-def send_alt_f4():
+def send_alt_f4(expected=None, report=None):
     # One attempt only. Never kill a process or retry an uncertain send.
     if any(U.GetAsyncKeyState(k)&0x8000 for k in (0x10,0x11,0x12,0x5B,0x5C)):
         return '未发送：Shift/Ctrl/Alt/Win 正被按住'
-    seq=(INPUT*4)(*[INPUT(type=1,u=INPUTUNION(ki=KEYBDINPUT(v,0,flags,0,0))) for v,flags in ((0x12,0),(0x73,0),(0x73,2),(0x12,2))])
-    count=U.SendInput(4,seq,C.sizeof(INPUT))
-    if count!=4:
-        # Release any partially pressed keys, without repeating the close chord.
-        releases=(INPUT*2)(*[INPUT(type=1,u=INPUTUNION(ki=KEYBDINPUT(v,0,2,0,0))) for v in (0x73,0x12)])
-        U.SendInput(2,releases,C.sizeof(INPUT))
-        return f'输入未完整发送（{count}/4），已停止，不重试'
+    if expected is not None and target()!=expected:return '未发送：游戏已失去前台'
+    def packet(flags):
+        return (INPUT*2)(*[INPUT(type=1,u=INPUTUNION(ki=KEYBDINPUT(v,0,flags,0,0))) for v in ((0x12,0x73) if flags==0 else (0x73,0x12))])
+    began=time.perf_counter();C.set_last_error(0)
+    down=U.SendInput(2,packet(0),C.sizeof(INPUT));down_error=C.get_last_error()
+    try:
+        if down==2:time.sleep(.040)
+    finally:
+        # Always release this chord, including partial sends and focus changes.
+        C.set_last_error(0)
+        up=U.SendInput(2,packet(2),C.sizeof(INPUT));up_error=C.get_last_error()
+    if report is not None:report.update(down_count=down,up_count=up,down_error=down_error,up_error=up_error,
+        hold_ms=40,elapsed_ms=round((time.perf_counter()-began)*1000,2),foreground_after=int(U.GetForegroundWindow() or 0))
+    if down!=2 or up!=2:
+        return f'输入未完整发送（按下 {down}/2，松开 {up}/2），已停止，不重试'
     return '已发送一次 Alt+F4；是否退出/回档需自行确认'
 
 class SquareToggle(tk.Frame):
@@ -472,12 +481,21 @@ class App:
                             self.event('absence_reset',combat_score=self.detector.last_features['combat_score'],menu_score=menu_score)
                         if fired:
                             self.active=False;self.token+=1
+                            exit_watch=None
                             if target()!=info:message='未发送：游戏已失去前台'
                             elif dry:message='只记录：已检测到 UI 消失，未发送按键'
-                            else:message=send_alt_f4()
+                            else:
+                                delivery={}
+                                process_handle=K.OpenProcess(0x100000,False,info[1])
+                                message=send_alt_f4(info,delivery)
+                                self.event('input_delivery',pid=info[1],hwnd=info[0],result=message,**delivery)
+                                if '已发送一次 Alt+F4' in message:
+                                    exit_watch=(process_handle,info[1],self.token)
+                                elif process_handle:K.CloseHandle(process_handle)
                             self.event('trigger',scores=scores,menu_score=menu_score,delay_ms=self.gate.delay_ms,dry_run=dry,result=message,features=self.detector.last_features,menu_features=self.detector.last_menu_features,extraction_cues=getattr(self.detector,'last_extraction',{}),extraction_trace=list(extraction_trace))
                             if diagnostic:diagnostic.mark('candidate_trigger',dict(features=dict(self.detector.last_features),menu_features=dict(self.detector.last_menu_features)))
                             self.ui.put(('status','已关闭 · '+message))
+                            if exit_watch:threading.Thread(target=self.observe_exit,args=exit_watch,daemon=True).start()
                     if fired:
                         # Evidence after a dry-run candidate only. Never send any
                         # further input, and stop collecting on focus/cancel.
@@ -502,12 +520,35 @@ class App:
                     except Exception:pass
                     self.event('capture_released')
 
+    def observe_exit(self,handle,pid,token):
+        began=time.perf_counter()
+        try:
+            result=K.WaitForSingleObject(handle,3000) if handle else 0xFFFFFFFF
+            if result==258:
+                self.event('exit_observation',pid=pid,state='pending',wait_result=258,elapsed_ms=round((time.perf_counter()-began)*1000,1))
+                self.ui.put(('exit_check',(token,'退出确认中 · 3 秒后进程仍在运行，继续观察至 30 秒')))
+                result=K.WaitForSingleObject(handle,27000)
+            state='exited' if result==0 else ('still_running' if result==258 else 'unavailable')
+            self.event('exit_observation',pid=pid,state=state,wait_result=int(result),elapsed_ms=round((time.perf_counter()-began)*1000,1))
+            message={'exited':'已确认游戏进程退出 · 回档结果需自行确认',
+                'still_running':'退出未确认 · 发送后 30 秒游戏进程仍在运行',
+                'unavailable':'无法确认游戏退出 · 进程观察不可用'}[state]
+            self.ui.put(('exit_check',(token,message)))
+        finally:
+            if handle:K.CloseHandle(handle)
+
     def tick(self):
         try:
             while True:
                 kind,text=self.ui.get_nowait()
                 if kind=='hotkey':
                     self.toggle();continue
+                if kind=='exit_check':
+                    token,message=text
+                    if token==self.token and not self.active and not self.arming:
+                        self.status.set(message);self.state_head.set('本轮停止 · '+('游戏已退出' if message.startswith('已确认') else '请检查退出结果'))
+                        self.bottom_status.set(message)
+                    continue
                 if kind=='diagnostic_saved':
                     self.diagnostic_status.set('诊断已保存：'+text);continue
                 (self.status if kind=='status' else self.scores).set(text)
@@ -521,7 +562,7 @@ class App:
                     self.state_head.set(head)
                     if text.startswith('监控中'):bottom='已暂停 · 切回游戏后继续' if '暂停' in text else '已开启 · F10 可关闭'
                     elif text.startswith('正在检查'):bottom='正在检查界面'
-                    elif '已发送一次 Alt+F4' in text:bottom='已执行大退 · 本轮监控结束'
+                    elif '已发送一次 Alt+F4' in text:bottom='退出按键已发送 · 正在确认游戏退出'
                     elif '只记录：已检测到' in text:bottom='演练候选已记录 · 未发送按键'
                     elif '撤离结束过渡' in text:bottom='撤离过渡已识别 · 监控停止'
                     elif '未开启' in text or '失败' in text or '错误' in text:bottom='未开启 · 请查看上方提示'

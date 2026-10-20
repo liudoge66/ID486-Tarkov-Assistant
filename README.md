@@ -19,6 +19,7 @@
 
 | 功能 | 当前实现 |
 | :--- | :--- |
+| 退出验证 | 按键保持 40 ms，发送后观察原进程至多 30 秒；不自动重试 |
 | 一键开关 | F10 开启 / 关闭，触发后自动停止 |
 | 视觉判断 | 人体轮廓、快捷栏矩形、标签边缘与少量颜色加权 |
 | 菜单识别 | 已采样的中文背包、ESC、设置及确认界面 |
@@ -29,7 +30,7 @@
 
 ### 🚀 开始使用
 
-**[下载 Windows 便携版（内嵌动漫音频）](https://github.com/liudoge66/ID486-Tarkov-Assistant/releases/download/v0.1.2-public-beta/ID486-Assistant-v0.1.2-public.zip)** · 解压后双击 EXE，无需安装 Python。
+**[下载 Windows 便携版（内嵌动漫音频）](https://github.com/liudoge66/ID486-Tarkov-Assistant/releases/download/v0.1.3-public-beta/ID486-Assistant-v0.1.3-public.zip)** · 解压后双击 EXE，无需安装 Python。
 
 
 **源码运行：** Windows 10/11、Python 3.11、可用的桌面捕获环境。
