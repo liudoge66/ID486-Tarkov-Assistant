@@ -8,12 +8,18 @@ import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, filedialog
+from tkinterdnd2 import TkinterDnD, DND_FILES
+from sound_library import SoundLibrary
+from primary_ui import PrimaryUI
+from tkinter import simpledialog
+from hotkey_service import Hotkeys, PRESETS as HOTKEY_PRESETS, label as hotkey_label, validate as validate_hotkey
+from tkinter import font as tkfont
 import winsound
 from collections import deque
-from detector import Detector, Gate, ExtractionGuard
+from detector import Detector, Gate, ExtractionGuard, ArmConfirmation, start_hud_evidence
 from diagnostics import Diagnostics
-APP_BUILD='2026.10.21-v0.1.3-exit-observation'
+APP_BUILD='2026.10.21-v0.2'
 
 U=C.WinDLL('user32',use_last_error=True)
 K=C.WinDLL('kernel32',use_last_error=True)
@@ -79,59 +85,22 @@ class WindowsNotice:
         enabled=text.startswith('监控中')
         actual_exit='已发送一次 Alt+F4' in text
         filename='return_by_death.wav' if actual_exit and self.return_sound_enabled else ('enabled.wav' if enabled else 'disabled.wav')
-        sound=Path(__file__).parent/'assets'/filename
+        library=getattr(self,'sound_library',None)
+        sound=library.resolve('exit' if actual_exit and self.return_sound_enabled else ('enabled' if enabled else 'disabled')) if library else Path(__file__).parent/'assets'/filename
         audio_ok=False
-        if '--smoke-test' not in sys.argv:
+        audio_allowed=not library or (not library.muted and library.enabled['exit' if actual_exit else ('enabled' if enabled else 'disabled')])
+        if library and actual_exit:sound=library.resolve('exit')
+        if '--smoke-test' not in sys.argv and audio_allowed and sound is not None:
             try:
                 winsound.PlaySound(str(sound),winsound.SND_FILENAME|winsound.SND_ASYNC|winsound.SND_NODEFAULT)
                 audio_ok=True
             except RuntimeError:pass
-        popup_ok=False
-        if self.available:
-            self.data.uFlags=0x10
-            self.data.szInfoTitle='ID486模拟助手 · 监控已开启' if enabled else 'ID486模拟助手 · 已停止 / 未开启'
-            self.data.szInfo=text[:255];self.data.dwInfoFlags=1
-            popup_ok=bool(self.shell.Shell_NotifyIconW(1,C.byref(self.data)))
-        state=C.c_int(-1)
-        self.shell.SHQueryUserNotificationState(C.byref(state))
-        return dict(enabled=enabled,audio_requested=audio_ok,popup_accepted=popup_ok,windows_notification_state=state.value)
+        # Keep the tray icon and app status, but never request Windows balloons.
+        return dict(enabled=enabled,audio_requested=audio_ok,popup_accepted=False,windows_notifications_enabled=False)
 
     def close(self):
         if self.available:self.shell.Shell_NotifyIconW(2,C.byref(self.data))
         if self.owned_icon:U.DestroyIcon(self.owned_icon)
-
-class Hotkeys:
-    """Own registration AND message retrieval on a dedicated native thread.
-
-    Tk consumes thread WM_HOTKEY messages before an after/PeekMessage poll can
-    reliably see them. Never register on the Tk thread.
-    """
-    def __init__(self, events):
-        self.events=events;self.registered=[];self.key_name='F10'
-        self.ready=threading.Event();self.thread_id=None
-        self.thread=threading.Thread(target=self.run,daemon=True)
-        self.thread.start()
-        if not self.ready.wait(3):raise RuntimeError('快捷键线程启动超时')
-
-    def run(self):
-        self.thread_id=K.GetCurrentThreadId()
-        msg=W.MSG()
-        U.PeekMessageW(C.byref(msg),None,0,0,0)  # establish native message queue
-        try:
-            for name,key in (('F10',0x79),):
-                if U.RegisterHotKey(None,1,0x4000,key):
-                    self.registered.append(1);self.key_name=name;break
-            self.ready.set()
-            if not self.registered:return
-            while U.GetMessageW(C.byref(msg),None,0,0)>0:
-                if msg.message==0x312 and msg.wParam==1:
-                    self.events.put(('hotkey',self.key_name))
-        finally:
-            for ident in self.registered:U.UnregisterHotKey(None,ident)
-
-    def close(self):
-        if self.thread_id:U.PostThreadMessageW(self.thread_id,0x12,0,0)
-        self.thread.join(timeout=1)
 
 def target():
     hwnd=U.GetForegroundWindow()
@@ -197,7 +166,7 @@ class SquareToggle(tk.Frame):
 
 class App:
     def __init__(self):
-        self.root=tk.Tk();self.root.title('ID486模拟助手');self.root.geometry('640x660');self.root.resizable(False,False)
+        self.root=TkinterDnD.Tk();self.root.title('ID486模拟助手');self.root.geometry('640x660');self.root.resizable(False,False)
         self.root.configure(bg='#F4F1FC')
         self.root.iconbitmap(str(Path(__file__).parent/'assets'/'subaru_clean.ico'))
         self.lock=threading.RLock();self.token=0;self.active=False;self.arming=False;self.closed=False
@@ -208,13 +177,27 @@ class App:
         except OSError:
             base=Path(os.environ['LOCALAPPDATA'])/'TarkovHUDMonitor';base.mkdir(exist_ok=True)
             self.log=open(base/'monitor_events.jsonl','a',encoding='utf-8',buffering=1)
-        self.hotkey_service=Hotkeys(self.ui)
+        self.config_path=base/'settings.json'
+        try:self._loaded_preferences=json.loads(self.config_path.read_text(encoding='utf-8'))
+        except (OSError,ValueError):self._loaded_preferences={}
+        if not isinstance(self._loaded_preferences,dict):self._loaded_preferences={}
+        self.sounds=SoundLibrary(base,Path(__file__).parent/'assets')
+        if 'sound_profile' in self._loaded_preferences:self.sounds.load_profile(self._loaded_preferences['sound_profile'])
+        self.sound_import_busy=False
+        self.hotkey_config=base/'hotkey_settings.json'
+        try:combo=validate_hotkey(self._loaded_preferences['hotkey_combo'] if 'hotkey_combo' in self._loaded_preferences else json.loads(self.hotkey_config.read_text(encoding='utf-8'))['combo'])
+        except (OSError,ValueError,TypeError,KeyError):combo=(0,0x79)
+        self.shortcut_dialog=None;self.recording=False
+        self.hotkey_service=Hotkeys(self.ui,combo)
+        if self._loaded_preferences.get("hotkey_enabled") is False:self.hotkey_service.clear()
         self.hotkeys=self.hotkey_service.registered
         self.key_name=self.hotkey_service.key_name
+        self.key_label=tk.StringVar(value=self.key_name)
+        self.key_hint=tk.StringVar(value=f'回到游戏后按 {self.key_name} 开启，再按一次停止')
         self.event('startup',hotkey=self.key_name,registered=bool(self.hotkeys),build=APP_BUILD)
         self.status=tk.StringVar(value=f'已关闭 · 进入战局、HUD 可见后按 {self.key_name}')
         self.scores=tk.StringVar(value='等待开启')
-        self.dry=tk.BooleanVar(value=True)
+        self.dry=tk.BooleanVar(value=self._loaded_preferences.get('dry_run',True) is not False)
         self.collect_enabled=False
         self.collect_var=tk.BooleanVar(value=False)
         self.diagnostic_status=tk.StringVar(value='截图默认关闭；手动开启后仅候选附近保存，最多2组 / 32MB')
@@ -223,7 +206,7 @@ class App:
         try:
             configured=int(json.loads(self.config_path.read_text(encoding='utf-8'))['delay_ms'])
             if not 50<=configured<=2000:raise ValueError()
-        except (OSError,ValueError,KeyError,TypeError):configured=150
+        except (OSError,ValueError,KeyError,TypeError):configured=300
         self.gate.delay_ms=configured
         self.delay_text=tk.StringVar(value=str(configured))
         try:
@@ -235,104 +218,258 @@ class App:
         self.build_ui()
         self.notice=WindowsNotice(self.root,self.key_name)
         self.notice.return_sound_enabled=self.return_sound.get()
+        self.notice.sound_library=self.sounds
         if not self.hotkeys:
-            self.status.set('快捷键注册失败：F10 已被占用，请关闭冲突后重启')
+            self.status.set(f'快捷键 {self.key_name} 已被占用，请点击快捷键设置选择其他按键')
         threading.Thread(target=self.worker,daemon=True).start()
         self.root.protocol('WM_DELETE_WINDOW',self.close)
         self.root.after(10,self.tick)
+        self.root.after(100,self.save_ui_theme)
 
     def build_ui(self):
-        bg='#F4F1FC';ink='#322D4A';muted='#827A98';purple='#8261CC';white='#FFFFFF'
-        self.root.option_add('*Font',('Microsoft YaHei UI',10))
+        self.primary_only=True
+        try:preferences=json.loads(self.config_path.read_text(encoding='utf-8'))
+        except (OSError,ValueError):preferences={}
+        self.ui_theme=preferences.get('ui_theme','dark')
+        self.state_head=tk.StringVar(value='未启动');self.bottom_status=tk.StringVar(value='等待开启')
+        self.return_sound=tk.BooleanVar(value=self.sounds.enabled['exit'])
+        self.sound_on_var=tk.BooleanVar(value=self.sounds.enabled['enabled'])
+        self.sound_off_var=tk.BooleanVar(value=self.sounds.enabled['disabled'])
+        self.mute_var=tk.BooleanVar(value=self.sounds.muted)
+        self.log_var=tk.BooleanVar(value=preferences.get('detailed_logs',False) is True)
+        self.detailed_logs=self.log_var.get()
+        self.collect_var.set(preferences.get('collect_screenshots',False) is True);self.collect_enabled=self.collect_var.get()
+        self.prep_feedback=tk.StringVar(value='');self.advanced_feedback=tk.StringVar(value='')
+        self.sound_vars={};self.sound_boxes={};self.audio_window=None
+        self.sound_hint=tk.StringVar(value='WAV / MP3 / FLAC / OGG · 50MB / 60秒以内')
         style=ttk.Style(self.root);style.theme_use('clam')
-        style.configure('R.TButton',background='#ECE5FA',foreground='#6343A1',borderwidth=0,padding=(12,8),font=('Microsoft YaHei UI',10))
-        style.map('R.TButton',background=[('active','#DDCFF5')])
-        style.configure('Stop.R.TButton',background='#8261CC',foreground='white')
-        style.map('Stop.R.TButton',background=[('active','#6D4EB4')])
-        style.configure('R.TCheckbutton',background=white,foreground=ink,indicatorcolor='#E7DEF6',padding=4)
-        style.map('R.TCheckbutton',indicatorcolor=[('selected','#9C7BD9')],background=[('active',white)])
-        style.configure('R.TCombobox',fieldbackground=white,foreground=ink,padding=4)
-        self.state_head=tk.StringVar(value='待命 · 新的一轮')
-        self.bottom_status=tk.StringVar(value='等待开启')
-        self.return_sound=tk.BooleanVar(value=True)
-        outer=tk.Frame(self.root,bg=bg);outer.pack(fill='both',expand=True,padx=24,pady=(18,14))
-        footer=tk.Frame(outer,bg=bg);footer.pack(side='bottom',fill='x',pady=(12,0))
-        self.bottom_label=tk.Label(footer,textvariable=self.bottom_status,bg=bg,fg=muted,font=('Microsoft YaHei UI',9),height=1,anchor='w')
-        self.bottom_label.pack(fill='x')
-        hero=tk.Frame(outer,bg=bg);hero.pack(fill='x')
-        self.mascot_image=tk.PhotoImage(file=str(Path(__file__).parent/'assets'/'mascot_ui.png'))
-        tk.Label(hero,image=self.mascot_image,bg=bg).pack(side='right',padx=(8,0))
-        names=tk.Frame(hero,bg=bg);names.pack(side='left',fill='both',expand=True,pady=(12,8))
-        tk.Label(names,text='ID486模拟助手',bg=bg,fg=ink,font=('Microsoft YaHei UI',27,'bold')).pack(anchor='w')
-        tk.Label(names,text='RETURN BY DEATH / TARKOV',bg=bg,fg=purple,font=('Segoe UI',10,'bold')).pack(anchor='w',pady=(3,9))
-        tk.Label(names,text='仅用于本地战局模拟大退 · 禁止线上使用',bg=bg,fg=muted,font=('Microsoft YaHei UI',9)).pack(anchor='w')
-        card=tk.Frame(outer,bg=white,highlightbackground='#E6DFF2',highlightthickness=1,padx=18,pady=15)
-        card.pack(fill='x',pady=(8,12))
-        heading=tk.Frame(card,bg=white);heading.pack(fill='x')
-        tk.Label(heading,textvariable=self.state_head,bg=white,fg=purple,font=('Microsoft YaHei UI',15,'bold')).pack(side='left')
-        tk.Label(heading,text=' F10 ',bg='#EDE6FA',fg='#7051AF',font=('Segoe UI',11,'bold'),padx=10,pady=4).pack(side='right')
-        tk.Label(card,textvariable=self.status,bg=white,fg=muted,font=('Microsoft YaHei UI',10),wraplength=540,justify='left').pack(anchor='w',pady=(12,10))
-        tk.Label(card,text='回到游戏后按 F10 开启，再按一次停止',bg=white,fg=ink,font=('Microsoft YaHei UI',10)).pack(anchor='w')
-        self.practice_toggle=SquareToggle(card,text='演练模式 · 只记录，不发送退出按键',variable=self.dry,
-            command=lambda:self.cancel('模式已切换，需重新按 F10'))
-        self.practice_toggle.pack(anchor='w',pady=(10,0))
-        audio=tk.Frame(outer,bg=white,padx=13,pady=8);audio.pack(fill='x',pady=(0,10))
-        self.audio_toggle=SquareToggle(audio,text='死亡回归音效 · 仅实际大退时播放',variable=self.return_sound,
-            command=lambda:setattr(self.notice,'return_sound_enabled',self.return_sound.get()))
-        self.audio_toggle.pack(anchor='w')
-        preview_row=tk.Frame(audio,bg=white);preview_row.pack(fill='x',pady=(6,2))
-        for label,name in (('试听开启','enabled.wav'),('试听关闭','disabled.wav'),('试听大退','return_by_death.wav')):
-            ttk.Button(preview_row,text=label,style='R.TButton',command=lambda n=name:self.play_sound(n)).pack(side='left',padx=(0,8))
-        actions=tk.Frame(outer,bg=bg);actions.pack(fill='x')
-        self.advanced_button=ttk.Button(actions,text='高级设置  ▾',style='R.TButton',command=self.toggle_advanced)
-        self.advanced_button.pack(side='left')
-        ttk.Button(actions,text='打开日志',style='R.TButton',command=lambda:os.startfile(self.log.name)).pack(side='left',padx=8)
-        ttk.Button(actions,text='停止监控',style='Stop.R.TButton',command=lambda:self.cancel('手动停止')).pack(side='right')
-        self.advanced=tk.Frame(outer,bg=white,padx=14,pady=12)
-        row=tk.Frame(self.advanced,bg=white);row.pack(fill='x')
-        tk.Label(row,text='延时 / 毫秒',bg=white,fg=ink).pack(side='left')
-        ttk.Entry(row,textvariable=self.delay_text,width=6).pack(side='left',padx=(8,10))
-        tk.Label(row,text='采样 / Hz',bg=white,fg=ink).pack(side='left')
-        ttk.Combobox(row,textvariable=self.hz_text,values=('15','30','60'),state='readonly',width=4,style='R.TCombobox').pack(side='left',padx=8)
-        ttk.Button(row,text='保存',style='R.TButton',command=self.apply_delay).pack(side='right')
-        ttk.Checkbutton(self.advanced,text='演练时收集顶部截图 · 最多 2 组 / 32MB',style='R.TCheckbutton',variable=self.collect_var,
-            command=lambda:setattr(self,'collect_enabled',self.collect_var.get())).pack(anchor='w',pady=(8,0))
-        tk.Label(self.advanced,textvariable=self.diagnostic_status,bg=white,fg=muted,wraplength=520,justify='left',font=('Microsoft YaHei UI',9)).pack(anchor='w',pady=(5,0))
-        self.advanced_open=False
-        self.fit_window()
+        style.configure('R.TButton',background='#34343C',foreground='#FFFFFF',padding=(12,8),font=('Microsoft YaHei UI',10))
+        style.map('R.TButton',background=[('active','#4A4A54')])
+        style.configure('R.TCombobox',padding=5)
+        self.runtime_dry=self.dry.get()
+        for variable in (self.return_sound,self.sound_on_var,self.sound_off_var,self.mute_var,self.delay_text,self.hz_text,self.collect_var,self.log_var,self.dry):
+            variable.trace_add('write',lambda *args:self.apply_runtime_settings())
+        self.apply_runtime_settings()
+        self.main_ui=PrimaryUI(self,Path(__file__).parent/'assets')
 
     def fit_window(self):
-        self.root.update_idletasks()
-        self.root.geometry(f"{max(640,self.root.winfo_reqwidth())}x{self.root.winfo_reqheight()}")
+        if hasattr(self,'main_ui'):self.main_ui.schedule()
 
-    def toggle_advanced(self):
-        self.advanced_open=not self.advanced_open
-        if self.advanced_open:
-            self.advanced.pack(fill='x',pady=(12,0))
-            self.advanced_button.configure(text='高级设置  ▴')
-        else:
-            self.advanced.pack_forget()
-            self.advanced_button.configure(text='高级设置  ▾')
-        self.fit_window()
+    def open_log(self):
+        os.startfile(self.log.name)
+
+    def write_preferences(self,**changes):
+        try:values=json.loads(self.config_path.read_text(encoding='utf-8'))
+        except (OSError,ValueError):values={}
+        values.update(changes)
+        temporary=self.config_path.with_suffix('.tmp')
+        temporary.write_text(json.dumps(values,ensure_ascii=False,indent=2),encoding='utf-8')
+        os.replace(temporary,self.config_path)
+
+    def save_ui_theme(self):
+        # Theme is local to this app, including the native title bar where supported.
+        try:
+            value=C.c_int(self.ui_theme=='dark');hwnd=U.GetAncestor(self.root.winfo_id(),2)
+            C.WinDLL('dwmapi').DwmSetWindowAttribute(W.HWND(hwnd),20,C.byref(value),4)
+        except (OSError,AttributeError):pass
+
+    def apply_runtime_settings(self):
+        try:
+            delay=int(self.delay_text.get());hz=int(self.hz_text.get())
+            if not 50<=delay<=2000 or hz not in (15,30,60):return False
+        except (ValueError,TypeError):return False
+        with self.lock:
+            changed=(self.gate.delay_ms!=delay or self.capture_hz!=hz)
+            self.gate.delay_ms=delay;self.capture_hz=hz
+            if changed:self.gate.missing_since=None;self.gate.last_observation=None;self.gate.missing=0
+            self.collect_enabled=self.collect_var.get();self.detailed_logs=self.log_var.get()
+            self.sounds.enabled=dict(enabled=self.sound_on_var.get(),disabled=self.sound_off_var.get(),exit=self.return_sound.get())
+            was_muted=self.sounds.muted;self.sounds.muted=self.mute_var.get()
+            if self.sounds.muted and not was_muted:winsound.PlaySound(None,0)
+            if hasattr(self,'notice'):self.notice.return_sound_enabled=self.return_sound.get()
+            mode=self.dry.get()
+            if mode!=self.runtime_dry and (self.active or self.arming):self.cancel('模式已切换，请重新开启')
+            self.runtime_dry=mode
+        return True
+
+    def persist_session(self):
+        if not self.apply_runtime_settings():raise ValueError('invalid settings')
+        self.write_preferences(profile_version=1,delay_ms=self.gate.delay_ms,capture_hz=self.capture_hz,
+            collect_screenshots=self.collect_enabled,detailed_logs=self.detailed_logs,ui_theme=self.ui_theme,
+            dry_run=self.dry.get(),hotkey_combo=list(self.hotkey_service.combo),hotkey_enabled=bool(self.hotkeys),
+            hotkey_choices=[list(c) for c in self.main_ui.key_choices],sound_profile=self.sounds.profile())
+
+    def save_preparation(self):
+        try:self.persist_session();self.prep_feedback.set('音效与快捷键已保存')
+        except (OSError,ValueError):self.prep_feedback.set('保存失败，请检查设置或目录写入权限')
+
+    def save_advanced(self):
+        try:self.persist_session();self.advanced_feedback.set('进阶自定义设置已保存')
+        except (OSError,ValueError):self.advanced_feedback.set('保存失败：延时需为50–2000毫秒，采样为15/30/60 Hz')
+
+    def edit_delay(self):
+        if getattr(self,'primary_only',False):return
+        value=simpledialog.askinteger('延时设置','持续缺失多少毫秒后触发（50–2000）',initialvalue=int(self.delay_text.get()),minvalue=50,maxvalue=2000,parent=self.root)
+        if value is not None:self.delay_text.set(str(value));self.advanced_feedback.set('尚未保存')
+
+    def edit_hz(self):
+        if getattr(self,'primary_only',False):return
+        menu=tk.Menu(self.root,tearoff=False)
+        for hz in (15,30,60):menu.add_command(label=f'{hz} Hz',command=lambda h=hz:(self.hz_text.set(str(h)),self.advanced_feedback.set('尚未保存')))
+        menu.tk_popup(self.root.winfo_pointerx(),self.root.winfo_pointery())
+
+    def open_sound_settings(self):
+        if getattr(self,'primary_only',False):return
+        if self.audio_window is not None:self.audio_window.lift();return
+        win=tk.Toplevel(self.root);self.audio_window=win;win.title('音效设置 · 二级界面待定')
+        win.configure(bg='#18181C');win.transient(self.root);win.resizable(False,False)
+        tk.Label(win,text='当前保留现有功能入口，二级布局待确认',bg='#18181C',fg='#999999',font=('Microsoft YaHei UI',10)).pack(anchor='w',padx=16,pady=(14,8))
+        self.sound_vars={};self.sound_boxes={}
+        for key,title in (('enabled','启动'),('disabled','关闭'),('exit','大退')):
+            row=tk.Frame(win,bg='#18181C');row.pack(fill='x',padx=16,pady=6)
+            tk.Label(row,text=title,bg='#18181C',fg='white',width=4).pack(side='left')
+            var=tk.StringVar(value=self.sounds.selected[key]);self.sound_vars[key]=var
+            box=ttk.Combobox(row,textvariable=var,values=self.sounds.choices(),state='readonly',width=30);box.pack(side='left',padx=8);self.sound_boxes[key]=box
+            box.bind('<<ComboboxSelected>>',lambda e,k=key:self.select_sound(k))
+            ttk.Button(row,text='试听',style='R.TButton',command=lambda k=key:self.play_sound(k)).pack(side='left',padx=4)
+            ttk.Button(row,text='导入',style='R.TButton',command=lambda k=key:self.pick_sound(k)).pack(side='left')
+            for widget in (row,box):
+                widget.drop_target_register(DND_FILES);widget.dnd_bind('<<Drop>>',lambda e,k=key:self.drop_sound(k,e.data))
+        tk.Label(win,textvariable=self.sound_hint,bg='#18181C',fg='#999999',wraplength=560).pack(padx=16,pady=8)
+        ttk.Button(win,text='停止试听',style='R.TButton',command=lambda:winsound.PlaySound(None,0)).pack(anchor='e',padx=16,pady=(0,12))
+        def close():self.sound_vars={};self.sound_boxes={};self.audio_window=None;win.destroy()
+        win.protocol('WM_DELETE_WINDOW',close)
 
     def play_sound(self,name):
-        winsound.PlaySound(str(Path(__file__).parent/'assets'/name),winsound.SND_FILENAME|winsound.SND_ASYNC|winsound.SND_NODEFAULT)
+        if self.sounds.muted:
+            self.sound_hint.set('静音模式已开启，请关闭静音并保存后再试听');return
+        key={'enabled.wav':'enabled','disabled.wav':'disabled','return_by_death.wav':'exit'}.get(name,name)
+        sound=self.sounds.resolve(key)
+        if sound is None:return
+        try:winsound.PlaySound(str(sound),winsound.SND_FILENAME|winsound.SND_ASYNC|winsound.SND_NODEFAULT)
+        except (RuntimeError,OSError):self.sound_hint.set('播放失败，请重新选择或导入音效')
+
+    def select_sound(self,key):
+        try:
+            self.sounds.choose(key,self.sound_vars[key].get());self.sound_hint.set('音效已即时生效 · 保存后下次保留');self.main_ui.schedule()
+        except OSError:
+            self.sound_vars[key].set(self.sounds.selected[key]);self.sound_hint.set('保存失败，请检查程序目录写入权限')
+
+    def open_shortcuts(self):
+        if getattr(self,'primary_only',False):return
+        if self.shortcut_dialog is not None:self.shortcut_dialog.lift();return
+        self.cancel('快捷键设置中，保存后需重新开启')
+        win=tk.Toplevel(self.root);self.shortcut_dialog=win;win.title('监控开启 / 关闭快捷键')
+        self.shortcut_refresh=None
+        win.configure(bg='#F4F1FC');win.resizable(False,False);win.transient(self.root)
+        self.hotkey_pick=tk.StringVar(value=','.join(map(str,self.hotkey_service.combo)))
+        self.hotkey_note=tk.StringVar(value='灰色删除线：当前无法注册；保存前再次检查')
+        self.hotkey_rows=[];self.custom_combo=None
+        normal=tkfont.Font(family='Microsoft YaHei UI',size=11)
+        strike=tkfont.Font(family='Microsoft YaHei UI',size=11,overstrike=True)
+        self.shortcut_fonts=(normal,strike)
+        tk.Label(win,text='预设快捷键',bg='#F4F1FC',font=('Microsoft YaHei UI',13,'bold')).pack(anchor='w',padx=18,pady=(15,4))
+        choices=list(HOTKEY_PRESETS)
+        if self.hotkey_service.combo not in choices:choices.append(self.hotkey_service.combo)
+        for combo in choices:
+            button=tk.Radiobutton(win,text=hotkey_label(combo),variable=self.hotkey_pick,value=','.join(map(str,combo)),bg='#F4F1FC',anchor='w',font=normal)
+            button.pack(fill='x',padx=18);self.hotkey_rows.append((combo,button))
+        ttk.Button(win,text='录制自定义快捷键',style='R.TButton',command=lambda:self.begin_record()).pack(fill='x',padx=18,pady=10)
+        self.custom_radio=tk.Radiobutton(win,text='尚未录制',variable=self.hotkey_pick,value='custom',state='disabled',bg='#F4F1FC',anchor='w',font=normal)
+        self.custom_radio.pack(fill='x',padx=18)
+        tk.Label(win,textvariable=self.hotkey_note,bg='#F4F1FC',wraplength=390,justify='left').pack(fill='x',padx=18,pady=8)
+        tk.Label(win,text='仅检测 Windows 系统热键占用，无法检测游戏内按键绑定。\n单键支持功能键/导航键；字母数字请搭配 Ctrl、Alt 或 Shift。\n录制时按 Esc 取消；F12 保留用于截图。',bg='#F4F1FC',fg='#74678B',justify='left',wraplength=390).pack(padx=18,pady=(0,12))
+        self.hotkey_apply=ttk.Button(win,text='保存快捷键',style='R.TButton',command=self.apply_shortcut)
+        self.hotkey_apply.pack(fill='x',padx=18,pady=(0,15))
+        def close():
+            if self.shortcut_refresh is not None:win.after_cancel(self.shortcut_refresh)
+            self.recording=False;self.shortcut_dialog=None;win.destroy()
+        win.protocol('WM_DELETE_WINDOW',close)
+        win.bind('<KeyPress>',self.record_key)
+        self.refresh_shortcuts()
+
+    def begin_record(self):
+        self.recording=True;self.hotkey_apply.configure(state='disabled')
+        self.hotkey_note.set('请按下一个按键或组合键（Esc 取消）');self.shortcut_dialog.focus_set()
+
+    def record_key(self,event):
+        if not self.recording:return
+        if event.keysym=='Escape':self.recording=False;self.hotkey_note.set('已取消录制');return 'break'
+        vk=event.keycode
+        if vk in (16,17,18,91,92,160,161,162,163,164,165):return 'break'
+        if any(U.GetAsyncKeyState(k)&0x8000 for k in (91,92)):
+            self.hotkey_note.set('不支持 Windows 键组合，请重新录制');return 'break'
+        mods=sum(bit for key,bit in ((17,2),(18,1),(16,4)) if U.GetAsyncKeyState(key)&0x8000)
+        self.record_combo((mods,vk));return 'break'
+
+    def record_combo(self,combo):
+        try:combo=validate_hotkey(combo)
+        except ValueError as exc:self.hotkey_note.set(str(exc));return
+        self.recording=False;self.custom_combo=combo;self.hotkey_pick.set('custom')
+        self.custom_radio.configure(text=hotkey_label(combo));self.hotkey_note.set('已录制 '+hotkey_label(combo)+'，保存后生效')
+        self.check_shortcuts()
+
+    def check_shortcuts(self):
+        normal,strike=self.shortcut_fonts
+        for combo,button in self.hotkey_rows:
+            free=self.hotkey_service.available(combo)
+            button.configure(state='normal' if free else 'disabled',fg='#322A44' if free else '#999999',font=normal if free else strike)
+        if self.custom_combo is not None:
+            free=self.hotkey_service.available(self.custom_combo)
+            self.custom_radio.configure(state='normal' if free else 'disabled',fg='#322A44' if free else '#999999',font=normal if free else strike)
+        choice=self.hotkey_pick.get()
+        combo=self.custom_combo if choice=='custom' else tuple(map(int,choice.split(',')))
+        free=combo is not None and self.hotkey_service.available(combo)
+        self.hotkey_apply.configure(state='normal' if free and not self.recording else 'disabled')
+
+    def refresh_shortcuts(self):
+        if self.shortcut_dialog is None:return
+        try:self.check_shortcuts()
+        except RuntimeError:self.hotkey_note.set('系统热键检查超时，请关闭设置后重试')
+        self.shortcut_refresh=self.shortcut_dialog.after(1500,self.refresh_shortcuts)
+
+    def apply_shortcut(self):
+        choice=self.hotkey_pick.get();combo=self.custom_combo if choice=='custom' else tuple(map(int,choice.split(',')))
+        if combo is None:return
+        try:
+            if not self.hotkey_service.rebind(combo):
+                self.hotkey_note.set('该快捷键已被占用，未修改原快捷键');self.check_shortcuts();return
+            self.key_name=self.hotkey_service.key_name;self.hotkeys=self.hotkey_service.registered
+            self.key_label.set(self.key_name);self.key_hint.set(f'回到游戏后按 {self.key_name} 开启，再按一次停止')
+            self.notice.data.szTip=f'ID486模拟助手 · {self.key_name} 开启/关闭'
+            if getattr(self.notice,'available',False):
+                self.notice.data.uFlags=4;self.notice.shell.Shell_NotifyIconW(1,C.byref(self.notice.data))
+            self.event('hotkey_changed',key=self.key_name)
+            if self.shortcut_refresh is not None:self.shortcut_dialog.after_cancel(self.shortcut_refresh)
+            self.recording=False;self.shortcut_dialog.destroy();self.shortcut_dialog=None
+            self.ui.put(('status',f'已关闭 · 快捷键已设为 {self.key_name}，请回到游戏后开启'))
+        except (ValueError,RuntimeError) as exc:self.hotkey_note.set(str(exc))
+
+    def pick_sound(self,key):
+        path=filedialog.askopenfilename(parent=self.root,title='选择音效（最多60秒 / 50MB）',filetypes=[('音频文件','*.wav *.mp3 *.flac *.ogg'),('所有文件','*.*')])
+        if path:self.import_sound(key,path)
+
+    def drop_sound(self,key,data):
+        paths=self.root.tk.splitlist(data)
+        if len(paths)!=1:self.sound_hint.set('每次请拖入一个音频文件');return
+        self.import_sound(key,paths[0])
+
+    def import_sound(self,key,path):
+        if self.sound_import_busy:self.sound_hint.set('正在导入，请稍候');return
+        if self.active or self.arming:self.sound_hint.set('请先按快捷键停止监控，再导入音频');return
+        self.sound_import_busy=True;self.sound_hint.set('正在转换音频，完成后自动保存…')
+        def convert():
+            try:result=self.sounds.prepare_import(path);self.ui.put(('sound_imported',(key,result,None)))
+            except Exception as exc:self.ui.put(('sound_imported',(key,None,str(exc))))
+        threading.Thread(target=convert,daemon=True).start()
 
     def apply_delay(self):
-        self.cancel('修改延时，需重新按 F10')
-        try:
-            value=int(self.delay_text.get())
-            if not 50<=value<=2000:raise ValueError()
-            hz=int(self.hz_text.get())
-            if hz not in (15,30,60):raise ValueError()
-            self.config_path.write_text(json.dumps({'delay_ms':value,'capture_hz':hz}),encoding='utf-8')
-            self.gate.delay_ms=value
-            self.capture_hz=hz
-            self.ui.put(('status',f'已关闭 · 已保存延时 {value} 毫秒、检测频率 {hz} 次/秒'))
-        except (ValueError,OSError):
-            self.ui.put(('status','未开启：请输入 50–2000 的整数，或检查目录写入权限'))
+        self.advanced_feedback.set('已即时生效，保存后下次保留' if self.apply_runtime_settings() else '延时或采样值无效')
 
     def event(self,kind,**details):
+        if not getattr(self,'detailed_logs',False):
+            if kind in ('performance','absence_reset'):return
+            details.pop('extraction_trace',None)
         self.log.write(json.dumps(dict(time=time.time(),event=kind,**details),ensure_ascii=False)+'\n')
         if kind=='diagnostic_saved':self.ui.put(('diagnostic_saved',details['path']))
 
@@ -344,6 +481,8 @@ class App:
 
     def toggle(self):
         with self.lock:
+            if self.sound_import_busy:
+                self.sound_hint.set('音频转换完成后即可开启监控');return
             self.event('hotkey_received',key=self.key_name,active=self.active,arming=self.arming)
             if self.active or self.arming:
                 self.cancel(self.key_name+' 关闭');return
@@ -365,7 +504,7 @@ class App:
             hz=self.capture_hz
             interval=1/hz
             self.gate.max_observation_gap=max(.12,2.5/hz)
-            diagnostic=getattr(self,'diagnostics',None) if dry and getattr(self,'collect_enabled',False) else None
+            diagnostic=getattr(self,'diagnostics',None) if getattr(self,'collect_enabled',False) else None
             if diagnostic:diagnostic.reset()
             camera=None
             extraction_guard=ExtractionGuard()
@@ -401,17 +540,28 @@ class App:
                 with self.lock:
                     if token!=self.token or self.closed:continue
                 if frame is None:
-                    self.cancel('采集暂时没有画面，请保持游戏前台，稍后重新按 F10');continue
-                scores,menu_score=self.detector.analyze(frame,full_size=(info[2],info[3]))
+                    self.cancel('采集暂时没有画面，请保持游戏前台，稍后重新按快捷键');continue
+                confirmation=ArmConfirmation(hz);confirmed=False;arm_deadline=time.perf_counter()+.8
+                scores=(0.,0.);menu_score=0.
+                while time.perf_counter()<arm_deadline:
+                    with self.lock:
+                        if token!=self.token or self.closed:break
+                    if target()!=info:break
+                    if frame is not None:
+                        if frame.shape[:2]!=shape:break
+                        scores,menu_score=self.detector.analyze(frame,full_size=(info[2],info[3]))
+                        if menu_score>=.55 or not start_hud_evidence(self.detector.last_features):break
+                        if confirmation.update(self.detector.last_features,time.perf_counter()):confirmed=True;break
+                    time.sleep(interval);frame=camera.grab(region=region,copy=False)
                 with self.lock:
                     if token!=self.token or self.closed:continue
                     self.arming=False
-                    if target()!=info or frame.shape[:2]!=shape or not self.gate.arm(scores,menu_present=menu_score>=.55,combat_score=self.detector.last_features["combat_score"]):
-                        self.event('arm_rejected',reason='HUD/窗口检查失败',scores=scores,menu_score=menu_score,
-                            frame_size=list(frame.shape[:2]),expected_size=list(shape),features=self.detector.last_features,menu_features=self.detector.last_menu_features,extraction_cues=getattr(self.detector,'last_extraction',{}))
-                        self.cancel('HUD 不匹配/不可见或窗口位置不符，未开启');continue
+                    if not confirmed or target()!=info or not self.gate.arm(scores,menu_present=menu_score>=.55,combat_score=self.detector.last_features["combat_score"],features=self.detector.last_features):
+                        self.event('arm_rejected',reason='首次开启需要稳定战斗HUD，菜单不能单独开启',arm_policy=confirmation.summary(),scores=scores,menu_score=menu_score,
+                            frame_size=list(frame.shape[:2]) if frame is not None else None,expected_size=list(shape),features=self.detector.last_features,menu_features=self.detector.last_menu_features,extraction_cues=getattr(self.detector,'last_extraction',{}))
+                        self.cancel('未观察到稳定战斗HUD，请在血量人形与快捷栏可见时开启');continue
                     self.active=True
-                    self.event('armed',dry_run=dry,scores=scores,menu_score=menu_score,
+                    self.event('armed',arm_policy=confirmation.summary(),dry_run=dry,scores=scores,menu_score=menu_score,
                         delay_ms=self.gate.delay_ms,capture_hz=hz,capture_region=list(region),features=self.detector.last_features,menu_features=self.detector.last_menu_features,extraction_cues=getattr(self.detector,'last_extraction',{}))
                     self.ui.put(('status','监控中 · '+('只记录，不退出' if dry else '战斗 HUD 和菜单均消失并超过设定延时才退出')))
                 last_new=time.perf_counter();last_ui=0;paused=False;next_tick=last_new
@@ -424,6 +574,14 @@ class App:
                 while True:
                     with self.lock:
                         if not self.active or token!=self.token or self.closed:break
+                        if hz!=self.capture_hz:
+                            hz=self.capture_hz;interval=1/hz;next_tick=time.perf_counter()
+                            self.gate.max_observation_gap=max(.12,2.5/hz)
+                        wanted=self.diagnostics if self.collect_enabled else None
+                        if wanted is not diagnostic:
+                            if diagnostic:diagnostic.reset()
+                            diagnostic=wanted
+                            if diagnostic:diagnostic.reset()
                     wait=next_tick-time.perf_counter()
                     if wait>0:time.sleep(wait)
                     next_tick=max(next_tick+interval,time.perf_counter())
@@ -497,7 +655,7 @@ class App:
                             self.ui.put(('status','已关闭 · '+message))
                             if exit_watch:threading.Thread(target=self.observe_exit,args=exit_watch,daemon=True).start()
                     if fired:
-                        # Evidence after a dry-run candidate only. Never send any
+                        # Optional bounded evidence after a candidate. Never send any
                         # further input, and stop collecting on focus/cancel.
                         trigger_token=self.token;tail_until=time.perf_counter()+.4
                         while diagnostic and not self.closed and self.token==trigger_token and time.perf_counter()<tail_until:
@@ -542,7 +700,25 @@ class App:
             while True:
                 kind,text=self.ui.get_nowait()
                 if kind=='hotkey':
-                    self.toggle();continue
+                    if self.main_ui.key_recording:
+                        self.main_ui.select_key(self.hotkey_service.combo);continue
+                    
+                    if self.shortcut_dialog is not None:
+                        if self.recording:self.record_combo(self.hotkey_service.combo)
+                    else:self.toggle()
+                    continue
+                if kind=='sound_imported':
+                    key,result,error=text;self.sound_import_busy=False
+                    if not error:
+                        try:
+                            self.sounds.register(key,*result)
+                            for box in self.sound_boxes.values():box.configure(values=self.sounds.choices())
+                            
+                            if key in self.sound_vars:self.sound_vars[key].set(result[0])
+                            self.sound_hint.set('已导入副本并即时生效 · 保存后下次保留')
+                        except OSError:error='音效设置保存失败，请检查目录写入权限'
+                    if error:self.sound_hint.set('导入失败：'+error)
+                    self.main_ui.schedule();self.fit_window();continue
                 if kind=='exit_check':
                     token,message=text
                     if token==self.token and not self.active and not self.arming:
@@ -553,14 +729,14 @@ class App:
                     self.diagnostic_status.set('诊断已保存：'+text);continue
                 (self.status if kind=='status' else self.scores).set(text)
                 if kind=='status':
-                    if text.startswith('监控中'):head='已暂停 · 等待回到游戏' if '暂停' in text else '守护中 · F10 可停止'
+                    if text.startswith('监控中'):head='已暂停 · 等待回到游戏' if '暂停' in text else f'守护中 · {self.key_name} 可停止'
                     elif text.startswith('正在检查'):head='正在连接战局…'
                     elif '只记录：已检测到' in text:head='候选已记录 · 本轮停止'
                     elif '已发送一次 Alt+F4' in text:head='已发送退出 · 本轮停止'
                     elif '未开启' in text or '失败' in text or '错误' in text:head='未连接 · 请检查提示'
                     else:head='待命 · 新的一轮'
                     self.state_head.set(head)
-                    if text.startswith('监控中'):bottom='已暂停 · 切回游戏后继续' if '暂停' in text else '已开启 · F10 可关闭'
+                    if text.startswith('监控中'):bottom='已暂停 · 切回游戏后继续' if '暂停' in text else f'已开启 · {self.key_name} 可关闭'
                     elif text.startswith('正在检查'):bottom='正在检查界面'
                     elif '已发送一次 Alt+F4' in text:bottom='退出按键已发送 · 正在确认游戏退出'
                     elif '只记录：已检测到' in text:bottom='演练候选已记录 · 未发送按键'
@@ -591,15 +767,26 @@ if __name__=='__main__':
             import dxcam
             from dxcam.processor.cv2_processor import Cv2Processor
             assert not app.active and not app.arming
-            assert len(app.hotkeys)==1, 'F10 registration failed'
+            assert len(app.hotkeys)==(0 if app._loaded_preferences.get('hotkey_enabled') is False else 1), 'Configured hotkey registration failed'
             assert app.notice.available, 'Windows notification registration failed'
             import wave
             for name in ('enabled.wav','disabled.wav'):
                 with wave.open(str(Path(__file__).parent/'assets'/name)) as audio:
                     assert audio.getnframes()>0 and audio.getframerate()==44100
+            import tempfile
+            with tempfile.TemporaryDirectory() as test_audio:
+                library=SoundLibrary(test_audio,Path(__file__).parent/'assets')
+                choice,filename=library.prepare_import(Path(__file__).parent/'assets'/'return_by_death.mp3')
+                library.register('exit',choice,filename)
+                assert library.resolve('exit').is_file()
+            assert app.hotkey_service.available(app.hotkey_service.combo)
             app.root.after(800,app.close)
         app.root.mainloop()
     except Exception as exc:
+        if '--smoke-test' in sys.argv:
+            if 'app' in locals():
+                app.event('smoke_error',error=repr(exc));app.close()
+            sys.exit(1)
         if '--smoke-test' not in sys.argv:
             U.MessageBoxW(None,str(exc),'HUD 监控启动失败',0x10)
         raise

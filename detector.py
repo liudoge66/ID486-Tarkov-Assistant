@@ -6,6 +6,23 @@ import numpy as np
 from timer_digits import TimerDigits
 cv2.setNumThreads(1)
 
+def start_hud_evidence(features):
+    """First arming needs independent battle-HUD evidence, never menus alone."""
+    return (features.get('combat_score',0)>=.48 and features.get('body_shape',0)>=.45
+            and features.get('bar_frames',0)>=.22 and features.get('label_shape',0)>=.35)
+
+class ArmConfirmation:
+    def __init__(self,hz=30):
+        self.first=None;self.last=None;self.frames=0;self.max_gap=max(.12,2.5/hz)
+    def update(self,features,now):
+        if not start_hud_evidence(features):self.first=None;self.last=None;self.frames=0;return False
+        if self.last is None or now-self.last>self.max_gap:self.first=now;self.frames=0
+        self.last=now;self.frames+=1
+        return self.frames>=3 and now-self.first>=.15
+    def summary(self):
+        return dict(frames=self.frames,stable_ms=0 if self.first is None or self.last is None else round((self.last-self.first)*1000,1),
+                    required_ms=150,min_frames=3,requires='combat + body + bar frames + label edges')
+
 class Detector:
     def __init__(self, asset_dir=None):
         root = Path(asset_dir or Path(__file__).parent / 'assets')
@@ -82,6 +99,10 @@ class Detector:
         # All anchors stay inside the existing top strip. Ignore selected-tab
         # grayscale polarity by matching inventory text edges instead.
         gray=cv2.cvtColor(top,cv2.COLOR_BGR2GRAY)
+        console=self.console_header(gray)
+        if console['present']:
+            self.last_menu_features=dict(console=1.,console_features=console,inventory=0.,settings=0.,pause=0.,confirmation=0.,skipped_for_combat=False)
+            return 1.
         def correlation(box,template,margin_x=2,margin_y=2):
             x1,y1,x2,y2=box
             region=gray[max(0,y1-margin_y):min(gray.shape[0],y2+margin_y),max(0,x1-margin_x):x2+margin_x]
@@ -102,8 +123,21 @@ class Detector:
         confirmation=min(confirm_title,confirm_subtitle)
         self.last_menu_features=dict(inventory=inventory,settings=settings,pause=pause,confirmation=confirmation,
             inventory_nav=inv_edge,inventory_return=inv_return,settings_title=settings_title,settings_return=settings_return,
-            pause_left=pause_left,pause_right=pause_right,confirm_title=confirm_title,confirm_subtitle=confirm_subtitle,skipped_for_combat=False)
+            pause_left=pause_left,pause_right=pause_right,confirm_title=confirm_title,confirm_subtitle=confirm_subtitle,skipped_for_combat=False,console_features=console)
         return max(inventory,settings,pause,confirmation)
+
+    @staticmethod
+    def console_header(gray):
+        # The empty command strip remains present without typed text or hints.
+        # Ignore the FPS overlay on the left. Require a broad flat dark strip
+        # ending in a strong, aligned horizontal discontinuity, not darkness alone.
+        band=gray[2:28,700:1780].astype('float32')
+        median=float(np.median(band));flat=float(np.mean(np.abs(band-median)<=2))
+        bottom_flat=float(np.mean(np.abs(gray[26:29,700:1780].astype('float32')-median)<=2))
+        below=gray[30:34,700:1780].astype('float32').mean(axis=0)
+        boundary=float(np.mean(np.abs(below-median)>=7))
+        present=18<=median<=115 and flat>=.93 and bottom_flat>=.78 and boundary>=.75
+        return dict(present=bool(present),level=round(median,2),flat_fraction=round(flat,4),bottom_flat=round(bottom_flat,4),boundary_fraction=round(boundary,4))
 
     def scores(self, frame):
         return self.scores_top(self.normalize_top(frame))
@@ -166,12 +200,30 @@ class ExtractionGuard:
         self.last_confirmation=None
         self.reason=reason
         self.zero_confirmed=False
+        self.count_value=None;self.count_since=None;self.count_steps=0;self.count_start=None;self.count_luma=0.;self.count_last=None
 
     def trace(self,now):
         return dict(phase='fade' if self.fade_start is not None else 'zero_tracking' if self.zero_last is not None else 'idle',
             reason=self.reason,zero_seen_seconds=None if self.zero_start is None else now-self.zero_start,
             fade_seconds=None if self.fade_start is None else now-self.fade_start,baseline_luma=self.zero_luma,falling_samples=self.falling,
-            zero_confirmed=self.zero_confirmed)
+            zero_confirmed=self.zero_confirmed,countdown_value=self.count_value,countdown_steps=self.count_steps,
+            expected_zero=None if self.count_since is None else self.count_since+self.count_value)
+
+    def track_countdown(self,now,cue,luma):
+        # A sequence of confident decrements can establish timing when the final
+        # glyph fades before 00. Unknown glyphs never become zero evidence.
+        digits=cue.get('timer_digits',[])
+        if cue.get('timer_state')!='nonzero' or len(digits)!=2:return
+        value=10*digits[0]+digits[1]
+        if not 1<=value<=30:return
+        if self.count_value is None:
+            self.count_value=value;self.count_since=now;self.count_start=now;self.count_steps=0
+        elif value!=self.count_value:
+            elapsed=now-self.count_since
+            if value==self.count_value-1 and .4<=elapsed<=1.7:self.count_steps+=1
+            else:self.count_steps=0;self.count_start=now
+            self.count_value=value;self.count_since=now
+        self.count_luma=luma;self.count_last=now
 
     def update(self,now,combat_score,menu_present,cue):
         if not cue:
@@ -180,6 +232,7 @@ class ExtractionGuard:
             self.reset('menu_visible');return False
         luma=cue['scene_luma']
         if cue['banner']:
+            self.track_countdown(now,cue,luma)
             self.fade_start=None;self.falling=0
             state=cue.get('timer_state','zero' if cue['zero_score']>=.93 else 'nonzero')
             if state=='zero' and cue['zero_score']<.93:state='unknown'
@@ -195,6 +248,11 @@ class ExtractionGuard:
             return False
         if self.fade_start is None:
             reason=None
+            countdown_ok=(self.count_value is not None and self.count_value<=2 and self.count_steps>=2
+                and now-self.count_start>=1.2 and now-self.count_last<=1.5
+                and -.9<=now-(self.count_since+self.count_value)<=1.5)
+            if self.zero_last is None and countdown_ok:
+                self.zero_last=now;self.zero_confirmed=True;self.zero_luma=self.count_luma
             if self.zero_last is None:reason='zero_not_observed'
             elif now-self.zero_last>1.0:reason='zero_evidence_expired'
             elif not self.zero_confirmed:reason='zero_seen_too_briefly'
@@ -227,8 +285,9 @@ class Gate:
         self.last_observation=None
         self.max_observation_gap=.2
 
-    def arm(self, scores, menu_present=False, combat_score=None):
-        self.active = menu_present or (combat_score>=.48 if combat_score is not None else (scores[0] >= .60 and scores[1] >= .70))
+    def arm(self, scores, menu_present=False, combat_score=None,features=None):
+        evidence=start_hud_evidence(features) if features is not None else (combat_score>=.48 and scores[0]>=.60 and scores[1]>=.40 if combat_score is not None else scores[0]>=.60 and scores[1]>=.70)
+        self.active = bool(evidence and not menu_present)
         self.missing = 0
         self.missing_since=None
         self.last_interface='menu' if menu_present else 'combat'
