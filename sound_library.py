@@ -13,10 +13,11 @@ class SoundLibrary:
     def __init__(self,base,assets):
         self.base=Path(base);self.assets=Path(assets)
         self.folder=self.base/'user_audio';self.config=self.base/'sound_settings.json'
-        self.deleted=[];self.custom={};self.selected=dict(DEFAULTS);self.enabled={k:True for k in DEFAULTS};self.muted=False
+        self.volumes={};self._device=None;self.deleted=[];self.custom={};self.selected=dict(DEFAULTS);self.enabled={k:True for k in DEFAULTS};self.muted=False
         try:
             data=json.loads(self.config.read_text(encoding='utf-8'))
             self.muted=data.get('muted',False) is True
+            self.load_volumes(data.get('volumes',{}))
             for key in DEFAULTS:self.enabled[key]=data.get('enabled',{}).get(key,True) is not False
             for label,name in data.get('custom',{}).items():
                 if isinstance(label,str) and isinstance(name,str) and Path(name).name==name and name.endswith('.wav'):
@@ -51,14 +52,15 @@ class SoundLibrary:
     def save(self):
         self.base.mkdir(parents=True,exist_ok=True)
         temp=self.config.with_suffix('.tmp')
-        temp.write_text(json.dumps(dict(selected=self.selected,custom=self.custom,enabled=self.enabled,muted=self.muted,deleted=list(self.deleted)),ensure_ascii=False,indent=2),encoding='utf-8')
+        temp.write_text(json.dumps(dict(selected=self.selected,custom=self.custom,enabled=self.enabled,muted=self.muted,deleted=list(self.deleted),volumes=dict(self.volumes)),ensure_ascii=False,indent=2),encoding='utf-8')
         os.replace(temp,self.config)
 
     def profile(self):
-        return dict(selected=dict(self.selected),custom=dict(self.custom),enabled=dict(self.enabled),muted=self.muted,deleted=list(self.deleted))
+        return dict(selected=dict(self.selected),custom=dict(self.custom),enabled=dict(self.enabled),muted=self.muted,deleted=list(self.deleted),volumes=dict(self.volumes))
 
     def load_profile(self,data):
         if not isinstance(data,dict):return
+        self.load_volumes(data.get('volumes',{}))
         self.deleted=[x for x in data.get('deleted',[]) if isinstance(x,str)]
         custom=data.get('custom',{})
         if isinstance(custom,dict):
@@ -101,3 +103,46 @@ class SoundLibrary:
         if label in self.deleted:self.deleted.remove(label)
         try:self.choose(key,label)
         except OSError:self.custom=old;raise
+
+    def load_volumes(self,values):
+        self.volumes={k:max(0,min(100,int(v))) for k,v in values.items()
+                      if isinstance(k,str) and isinstance(v,(int,float)) and 0<=v<=100} if isinstance(values,dict) else {}
+
+    def volume(self,choice=None):
+        return self.volumes.get(choice if choice is not None else self.selected['exit'],50)
+
+    def set_volume(self,choice,value):
+        if choice in self.choices():self.volumes[choice]=max(0,min(100,round(value)))
+
+    def stop(self):
+        device=self._device;self._device=None
+        if device is not None:device.close()
+
+    def play(self,key):
+        """A private playback device; gain changes affect this clip, never system audio."""
+        import miniaudio
+        import numpy as np
+        path=self.resolve(key)
+        if path is None or self.muted:return False
+        choice=self.selected[key]
+        self.stop()
+        source=miniaudio.stream_file(str(path),nchannels=1,sample_rate=44100,frames_to_read=1024)
+        def samples():
+            try:
+                needed=yield b''
+                while True:
+                    raw=source.send(needed)
+                    pcm=np.frombuffer(raw,dtype=np.int16)
+                    needed=yield (pcm.astype(np.float32)*(self.volume(choice)/100.)).astype(np.int16).tobytes()
+            except StopIteration:return
+            finally:source.close()
+        generator=samples();next(generator)
+        device=None
+        try:
+            device=miniaudio.PlaybackDevice(nchannels=1,sample_rate=44100,buffersize_msec=50)
+            device.start(generator);self._device=device
+        except Exception as exc:
+            generator.close()
+            if device is not None:device.close()
+            raise RuntimeError('无法播放音效') from exc
+        return True

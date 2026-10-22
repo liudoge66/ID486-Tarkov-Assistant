@@ -15,8 +15,9 @@ class Control:
     enabled:bool=True
 
 from dropdowns import Dropdowns
+from volume_control import VolumeControl
 
-class PrimaryUI(Dropdowns):
+class PrimaryUI(VolumeControl,Dropdowns):
     def __init__(self,app,assets):
         self.app=app;self.assets=Path(assets);self.art=self.assets/'ui_v2'
         self.meta=json.loads((self.art/'manifest.json').read_text(encoding='utf-8'))
@@ -33,8 +34,10 @@ class PrimaryUI(Dropdowns):
         self.canvas=tk.Canvas(app.root,highlightthickness=0,bd=0,bg='#111115',takefocus=True);self.canvas.pack(fill='both',expand=True)
         self.canvas_item=self.canvas.create_image(0,0,anchor='nw')
         self.setup_dropdowns()
+        self.setup_volume()
         self.previous_source=None;self.display_pil=None;self.previous_moving=False;self.previous_theme=None;self.border_cache={}
         for event,fn in [('<Configure>',lambda e:self.schedule()),('<Button-1>',self.mouse_down),('<ButtonRelease-1>',self.mouse_up),('<Motion>',self.motion),('<Leave>',self.leave),('<Tab>',self.tab),('<Shift-Tab>',lambda e:self.tab(e,-1)),('<Return>',self.activate),('<space>',self.activate),('<FocusOut>',self.focus_out)]:self.canvas.bind(event,fn)
+        for key in ('<Left>','<Right>','<Home>','<End>'):self.canvas.bind(key,self.volume_key)
         for v in (app.status,app.bottom_status,app.state_head,app.key_label,app.dry,app.return_sound,app.mute_var,app.sound_on_var,app.sound_off_var,app.delay_text,app.hz_text,app.collect_var,app.log_var):v.trace_add('write',lambda *args:self.schedule())
         for k,v in (('prep',app.prep_feedback),('advanced',app.advanced_feedback)):v.trace_add('write',lambda *args,k=k,v=v:self.notice_changed(k,v))
         s=min(.72,(app.root.winfo_screenwidth()-100)/1320,(app.root.winfo_screenheight()-130)/1758)
@@ -129,6 +132,7 @@ class PrimaryUI(Dropdowns):
                 r=self.meta[key]['bbox'];self.paste(im,self.colored(self.tile(key),fg),r[0],r[1])
         self.fill(d,(143,462,253,494),card)
         self.paste(im,self.text_tile('大退音效',24,fg),143,465)
+        self.paste(im,self.text_tile(getattr(self.app,'version_label',''),14,mix((85,85,93),(119,113,125),theme),en=True),698,201)
         self.draw_segment(im,'preview',(143,509,253,572),self.preview,theme);self.draw_segment(im,'check',(730,508,943,572),self.check_hotkey,theme)
         for name,r,default,value in [('audio_value',(250,508,665,572),'原版死亡回归',self.app.sounds.selected['exit'] or '无音效'),('hotkey_value',(940,508,1253,572),'F10',self.app.key_name),('delay_value',(828,1077,920,1138),'300',self.app.delay_text.get()),('hz_value',(1180,1077,1255,1138),'30',self.app.hz_text.get())]:
             self.fill(d,(r[0]+2,r[1]+3,r[2]-2,r[3]-3),field)
@@ -158,8 +162,9 @@ class PrimaryUI(Dropdowns):
                 if mute:tile=Image.blend(tile,Image.new('RGB',tile.size,card),mute*.5)
                 im.paste(tile,(r[0]-60,r[1]-81))
         self.draw_notices(im,card,muted);self.draw_status(im,card,fg,muted)
-        for key,r,title,fn in [('open_log',(140,1770,290,1815),'打开日志',self.app.open_log),('stop',(1100,1770,1300,1815),'停止监控',lambda:self.app.cancel('手动停止'))]:
+        for key,r,title,fn in [('video_test',(534,1770,854,1815),'录像测试',self.app.open_video_test),('open_log',(140,1770,290,1815),'打开日志',self.app.open_log),('stop',(1100,1770,1300,1815),'停止监控',lambda:self.app.cancel('手动停止'))]:
             self.control(key,r,fn);h=self.tween('hover:'+key,float(self.hover_key==key),.12);self.centered(im,self.text_tile(title,21,mix(muted,fg,h)),r)
+        self.draw_volume(im,muted)
         if self.dropdown or self.dropdown_paint:
             self.draw_dropdown(im,theme)
         if self.dropdown:
@@ -191,6 +196,7 @@ class PrimaryUI(Dropdowns):
         else:
             regions=[c.rect for c in self.controls.values()]
             regions += [(250,508,700,900),(940,508,1287,845),(825,1077,952,1305),(1178,1077,1287,1305)]
+            regions += [(140,575,705,612)]
             regions += [(138,664,1036,705),(138,1358,1036,1403),(96,1479,1331,1739)]
             regions += [self.meta[k]['bbox'] for k in ('on_label','off_label','exit_label')]
             changed=False;settling=self.previous_moving and not self.moving
@@ -273,6 +279,11 @@ class PrimaryUI(Dropdowns):
         status=self.app.bottom_status.get()
         if self.app.active:return ('已暂停' if '暂停' in status else '监控中','#6DAE8A')
         if self.app.arming:return ('正在连接','#BB9B5D')
+        if status.startswith('录像测试中'):return ('录像测试中','#BB9B5D')
+        if status.startswith('录像已退出'):return ('录像已退出','#6DAE8A')
+        if status.startswith('录像已结束'):return ('录像已结束','#6DAE8A')
+        if status.startswith('录像已关闭'):return ('录像已关闭',p['muted'])
+        if status.startswith('录像退出未确认'):return ('录像退出未确认',p['accent'])
         if status.startswith('已确认游戏进程退出'):return ('游戏已退出','#6DAE8A')
         if '退出确认中' in status or '按键已发送' in status:return ('退出确认中','#BB9B5D')
         if '退出未确认' in status or '无法确认' in status:return ('退出未确认',p['accent'])
@@ -295,18 +306,24 @@ class PrimaryUI(Dropdowns):
         return None
     def mouse_down(self,e):
         self.canvas.focus_set();self.focus_visible=False;key=self.target(e)
+        if key=='volume_slider':
+            self.volume_drag=True;self.set_volume_at(e);return
         if self.dropdown and not (key and (key.startswith(('drop_','delete_')) or key in ('audio_value','hotkey_value','audio_arrow','key_arrow','delay_value','hz_value','delay_arrow','hz_arrow'))):
             self.close_dropdown();self.pressed_key=None;return
         self.pressed_key=key;self.focus_key=key;self.schedule()
     def mouse_up(self,e):
+        if self.volume_drag:
+            self.set_volume_at(e);self.volume_drag=False;self.volume_pointer(e);self.volume_deadline=self.clock()+1.5;self.schedule();return
         key=self.target(e);pressed=self.pressed_key;self.pressed_key=None
         if key is not None and key==pressed:self.pulses[key]=self.clock()+.06;self.controls[key].action()
         self.schedule()
     def click(self,e):self.mouse_down(e);self.mouse_up(e)
     def motion(self,e):
+        self.volume_pointer(e)
         key=self.target(e);self.canvas.configure(cursor='hand2' if key else '')
         if key!=self.hover_key:self.hover_key=key;self.schedule()
-    def leave(self,e):self.hover_key=None;self.schedule()
+    def leave(self,e):
+        self.volume_held=False;self.volume_deadline=self.clock()+1.5;self.hover_key=None;self.schedule()
     def focus_out(self,e):self.focus_visible=False;self.schedule()
     def tab(self,e,direction=1):
         keys=[k for k,c in self.controls.items() if c.enabled and c.action]

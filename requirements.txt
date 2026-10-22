@@ -5,3 +5,4 @@ Pillow>=11,<13
 comtypes==1.4.17
 miniaudio==1.71
 tkinterdnd2==0.6.4
+av==18.1.0

@@ -13,3 +13,9 @@ diagnostics/
 *.mp3
 *.log
 offline_validation.csv
+
+user_audio/
+keyboard_diagnostics/
+video_test_results/
+sound_settings.json
+hotkey_settings.json

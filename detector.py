@@ -4,6 +4,7 @@ import time
 import cv2
 import numpy as np
 from timer_digits import TimerDigits
+from hud_layout import candidates as layout_candidates,project as project_layout
 cv2.setNumThreads(1)
 
 def start_hud_evidence(features):
@@ -12,16 +13,13 @@ def start_hud_evidence(features):
             and features.get('bar_frames',0)>=.22 and features.get('label_shape',0)>=.35)
 
 class ArmConfirmation:
-    def __init__(self,hz=30):
-        self.first=None;self.last=None;self.frames=0;self.max_gap=max(.12,2.5/hz)
+    def __init__(self,hz=30):self.first=None;self.last=None;self.frames=0
     def update(self,features,now):
-        if not start_hud_evidence(features):self.first=None;self.last=None;self.frames=0;return False
-        if self.last is None or now-self.last>self.max_gap:self.first=now;self.frames=0
-        self.last=now;self.frames+=1
-        return self.frames>=3 and now-self.first>=.15
+        if not start_hud_evidence(features):return False
+        self.first=self.last=now;self.frames=1;return True
     def summary(self):
-        return dict(frames=self.frames,stable_ms=0 if self.first is None or self.last is None else round((self.last-self.first)*1000,1),
-                    required_ms=150,min_frames=3,requires='combat + body + bar frames + label edges')
+        return dict(frames=self.frames,stable_ms=0,required_ms=0,min_frames=1,
+                    requires='combat + body + bar frames + label edges')
 
 class Detector:
     def __init__(self, asset_dir=None):
@@ -50,30 +48,40 @@ class Detector:
         self.labels=cv2.imread(str(root/'label_shape.png'),0)
         if any(x is None for x in (self.bar_h,self.bar_v,self.labels)):raise ValueError('Shape references missing')
         self.last_features={}
+        self.reset_layout()
 
-    def normalize_top(self, frame, full_size=None):
-        h,w=frame.shape[:2]
-        full_w,full_h=full_size or (w,h)
-        if w!=full_w or abs(full_w/full_h-16/9)>.025:
-            raise ValueError('Only 16:9 game area supported by this HUD profile')
-        strip_h=round(full_h*240/1080)
-        if h<strip_h:raise ValueError('Capture strip is too short')
-        top=cv2.resize(frame[:strip_h],(1920,240))
-        if top.shape[2]==4:
-            top=cv2.cvtColor(top,cv2.COLOR_BGRA2BGR)
+    def reset_layout(self):
+        self.layout=None;self.layout_info={};self.menu_top=None;self.extraction_top=None
+
+    def normalize_top(self,frame,full_size=None):
+        h,w=frame.shape[:2];full_size=full_size or (w,h)
+        if self.layout is not None and (self.layout['width'],self.layout['height'])!=tuple(full_size):self.reset_layout()
+        if self.layout is not None:
+            top,self.menu_top,self.extraction_top,self.layout_info=project_layout(frame,self.layout)
+            return top
+        best=None
+        for layout in layout_candidates(frame,full_size):
+            top,menu,extract,info=project_layout(frame,layout)
+            self.scores_top(top)
+            score=self.last_features['combat_score']
+            if best is None or score>best[0]:best=(score,top,menu,extract,info,layout,dict(self.last_features))
+            if start_hud_evidence(self.last_features):break
+        _,top,self.menu_top,self.extraction_top,self.layout_info,layout,feature=best
+        if start_hud_evidence(feature):self.layout=layout
         return top
 
     def analyze(self, frame, full_size=None):
         top=self.normalize_top(frame,full_size)
         self.last_top=top  # owned resize output; safe for a bounded diagnostic ring
-        self.last_extraction=self.extraction_features(top)
+        self.last_extraction=self.extraction_features(self.extraction_top)
         scores=self.scores_top(top)
+        self.last_features['layout']=dict(self.layout_info)
         # A confident combat HUD already prevents absence. Avoid expensive logo
         # searches in this common case; inspect menus only when HUD is unclear.
         if self.last_features['combat_score']>=.48:
             self.last_menu_features=dict(inventory=0.,settings=0.,pause=0.,confirmation=0.,skipped_for_combat=True)
             return scores,0.
-        return scores,self.menu_score_top(top)
+        return scores,self.menu_score_top(self.menu_top)
 
     def extraction_features(self,top):
         scene_luma=float(cv2.cvtColor(top[100:230,200:1600],cv2.COLOR_BGR2GRAY).mean())
@@ -93,7 +101,8 @@ class Detector:
             timer_state=timer['state'],timer_digits=timer['digits'],timer_scores=timer['scores'],timer_margins=timer['margins'],scene_luma=scene_luma)
 
     def menu_score(self, frame):
-        return self.menu_score_top(self.normalize_top(frame))
+        self.normalize_top(frame)
+        return self.menu_score_top(self.menu_top)
 
     def menu_score_top(self, top):
         # All anchors stay inside the existing top strip. Ignore selected-tab
@@ -213,17 +222,19 @@ class ExtractionGuard:
         # A sequence of confident decrements can establish timing when the final
         # glyph fades before 00. Unknown glyphs never become zero evidence.
         digits=cue.get('timer_digits',[])
-        if cue.get('timer_state')!='nonzero' or len(digits)!=2:return
+        if cue.get('timer_state') not in ('nonzero','zero') or len(digits)!=2:return False
         value=10*digits[0]+digits[1]
-        if not 1<=value<=30:return
+        if not 0<=value<=30:return False
+        decreased=self.count_value is not None and value<self.count_value
         if self.count_value is None:
             self.count_value=value;self.count_since=now;self.count_start=now;self.count_steps=0
         elif value!=self.count_value:
             elapsed=now-self.count_since
-            if value==self.count_value-1 and .4<=elapsed<=1.7:self.count_steps+=1
+            if decreased:self.count_steps+=1
             else:self.count_steps=0;self.count_start=now
             self.count_value=value;self.count_since=now
         self.count_luma=luma;self.count_last=now
+        return decreased
 
     def update(self,now,combat_score,menu_present,cue):
         if not cue:
@@ -234,9 +245,9 @@ class ExtractionGuard:
         if cue['banner']:
             self.track_countdown(now,cue,luma)
             self.fade_start=None;self.falling=0
-            state=cue.get('timer_state','zero' if cue['zero_score']>=.93 else 'nonzero')
-            if state=='zero' and cue['zero_score']<.93:state='unknown'
-            if state=='zero' and cue['zero_score']>=.93:
+            state=cue.get('timer_state','zero' if cue['zero_score']>=.80 else 'nonzero')
+            if state=='zero' and cue['zero_score']<.80:state='unknown'
+            if state=='zero' and cue['zero_score']>=.80:
                 if self.zero_start is None:self.zero_start=now
                 self.zero_last=now;self.zero_luma=luma
                 if now-self.zero_start>=.15:self.zero_confirmed=True
@@ -248,9 +259,7 @@ class ExtractionGuard:
             return False
         if self.fade_start is None:
             reason=None
-            countdown_ok=(self.count_value is not None and self.count_value<=2 and self.count_steps>=2
-                and now-self.count_start>=1.2 and now-self.count_last<=1.5
-                and -.9<=now-(self.count_since+self.count_value)<=1.5)
+            countdown_ok=self.count_value is not None and self.count_steps>=1
             if self.zero_last is None and countdown_ok:
                 self.zero_last=now;self.zero_confirmed=True;self.zero_luma=self.count_luma
             if self.zero_last is None:reason='zero_not_observed'
@@ -305,8 +314,6 @@ class Gate:
             return False
         now=time.perf_counter() if now is None else now
         if combat_score is not None:
-            if self.last_observation is not None and now-self.last_observation>self.max_observation_gap:
-                self.missing_since=None;self.missing=0
             self.last_observation=now
             # The delay must contain continuously confirmed absence, not just
             # lack of a high-confidence recovery. Uncertainty resets the clock.
@@ -315,7 +322,8 @@ class Gate:
                 return False
             if combat_score<=.22:
                 if self.missing_since is None:self.missing_since=now
-                if (now-self.missing_since)*1000>=self.delay_ms:
+                self.missing+=1
+                if self.missing>=2 and (now-self.missing_since)*1000>=self.delay_ms:
                     self.cancel();return True
             return False
         if menu_present:self.last_interface='menu'

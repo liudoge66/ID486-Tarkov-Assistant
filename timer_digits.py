@@ -47,6 +47,6 @@ class TimerDigits:
             ranked=sorted(by_label.items(),key=lambda pair:pair[1],reverse=True)
             label,score=ranked[0]
             digits.append(label);scores.append(score);margins.append(score-ranked[1][1]);zero_scores.append(by_label.get(0,0.))
-        confident=all(score>=.90 and margin>=.035 for score,margin in zip(scores,margins))
+        confident=all(score>=.80 and margin>=.035 for score,margin in zip(scores,margins))
         state=('zero' if digits==[0,0] else 'nonzero') if confident else 'unknown'
         return dict(state=state,zero_score=min(zero_scores),digits=digits,scores=scores,margins=margins)

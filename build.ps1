@@ -2,5 +2,5 @@ $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
 $taskPython = Join-Path $PSScriptRoot '.venv/Scripts/python.exe'
 if (!(Test-Path -LiteralPath $taskPython)) { throw 'Create .venv and install requirements-build.txt first.' }
-& $taskPython -m PyInstaller --noconfirm --onefile --windowed --name 'ID486模拟助手' --version-file "$PSScriptRoot/version_info.txt" --icon "$PSScriptRoot/assets/subaru_clean.ico" --collect-all tkinterdnd2 --hidden-import _cffi_backend --hidden-import dxcam.processor._numpy_kernels --add-data "$PSScriptRoot/assets;assets" monitor.py
+& $taskPython -m PyInstaller --noconfirm --onefile --windowed --name 'ID486模拟助手' --version-file "$PSScriptRoot/version_info.txt" --icon "$PSScriptRoot/assets/subaru_clean.ico" --collect-all tkinterdnd2 --collect-all av --hidden-import _cffi_backend --hidden-import dxcam.processor._numpy_kernels --add-data "$PSScriptRoot/assets;assets" monitor.py
 if ($LASTEXITCODE -ne 0) { throw 'Build failed.' }
