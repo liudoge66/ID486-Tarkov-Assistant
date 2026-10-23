@@ -7,10 +7,15 @@ from timer_digits import TimerDigits
 from hud_layout import candidates as layout_candidates,project as project_layout
 cv2.setNumThreads(1)
 
-def start_hud_evidence(features):
+def combat_hud_evidence(features):
     """First arming needs independent battle-HUD evidence, never menus alone."""
     return (features.get('combat_score',0)>=.48 and features.get('body_shape',0)>=.45
             and features.get('bar_frames',0)>=.22 and features.get('label_shape',0)>=.35)
+
+def start_hud_evidence(features):
+    """Arming accepts any one HUD channel; death thresholds are independent."""
+    return any(features.get(key,0)>=threshold for key,threshold in
+               [('combat_score',.48),('body_shape',.45),('bar_frames',.22),('label_shape',.35)])
 
 class ArmConfirmation:
     def __init__(self,hz=30):self.first=None;self.last=None;self.frames=0
@@ -19,7 +24,7 @@ class ArmConfirmation:
         self.first=self.last=now;self.frames=1;return True
     def summary(self):
         return dict(frames=self.frames,stable_ms=0,required_ms=0,min_frames=1,
-                    requires='combat + body + bar frames + label edges')
+                    requires='any: combat >= .48 OR body >= .45 OR bar frames >= .22 OR label edges >= .35')
 
 class Detector:
     def __init__(self, asset_dir=None):
@@ -65,10 +70,14 @@ class Detector:
             self.scores_top(top)
             score=self.last_features['combat_score']
             if best is None or score>best[0]:best=(score,top,menu,extract,info,layout,dict(self.last_features))
-            if start_hud_evidence(self.last_features):break
+            if combat_hud_evidence(self.last_features):break
         _,top,self.menu_top,self.extraction_top,self.layout_info,layout,feature=best
-        if start_hud_evidence(feature):self.layout=layout
+        if combat_hud_evidence(feature):self.layout=layout
         return top
+
+    def lock_current_layout(self):
+        if self.layout is None and self.layout_info:
+            self.layout={key:self.layout_info[key] for key in ('left','right','top','width','height')}
 
     def analyze(self, frame, full_size=None):
         top=self.normalize_top(frame,full_size)
@@ -309,7 +318,7 @@ class Gate:
         self.missing_since=None
         self.last_observation=None
 
-    def update(self, scores, menu_present=False, now=None, combat_score=None):
+    def update(self, scores, menu_present=False, now=None, combat_score=None,features=None):
         if not self.active:
             return False
         now=time.perf_counter() if now is None else now
@@ -317,7 +326,9 @@ class Gate:
             self.last_observation=now
             # The delay must contain continuously confirmed absence, not just
             # lack of a high-confidence recovery. Uncertainty resets the clock.
-            if menu_present or combat_score>.22:
+            self.last_visibility={key:features.get(key,0) for key in ('combat_score','body_shape','bar_frames','label_shape')} if features is not None else None
+            hud_visible=start_hud_evidence(features) if features is not None else False
+            if menu_present or hud_visible or combat_score>.22:
                 self.missing=0;self.missing_since=None
                 return False
             if combat_score<=.22:

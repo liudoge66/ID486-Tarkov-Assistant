@@ -40,7 +40,7 @@ class EventWindow:
 
 class KeyboardDiagnostics:
     def __init__(self,folder):
-        self.window=EventWindow();self.folder=Path(folder);self.stop=threading.Event();self.ready=threading.Event();self.available=False;self.error=None
+        self.escape_serial=0;self.escape_pid=None;self.window=EventWindow();self.folder=Path(folder);self.stop=threading.Event();self.ready=threading.Event();self.available=False;self.error=None
         self.max_callback_ms=0.;self.callback_count=0;self.thread=threading.Thread(target=self.run,daemon=True);self.thread.start();self.ready.wait(2)
     def start(self,pid):self.window.start(pid)
     def pause(self):self.window.pause()
@@ -66,6 +66,8 @@ class KeyboardDiagnostics:
                 if code>=0 and (self.window.armed or self.window.pending):
                     pid=W.DWORD();hwnd=u.GetForegroundWindow();u.GetWindowThreadProcessId(hwnd,C.byref(pid))
                     key=C.cast(ptr,C.POINTER(Key)).contents
+                    if key.vk==0x1B and not key.flags&0x90 and self.window.armed and int(pid.value)==self.window.pid:
+                        self.escape_pid=int(pid.value);self.escape_serial+=1
                     names={0xA0:'LShift',0xA1:'RShift',0xA2:'LCtrl',0xA3:'RCtrl',0xA4:'LAlt',0xA5:'RAlt',0x5B:'LWin',0x5C:'RWin',0x73:'F4'}
                     name=names.get(key.vk,('F'+str(key.vk-0x6F)) if 0x70<=key.vk<=0x87 else ('VK_%02X'%key.vk))
                     self.window.add(dict(t=begin,wall_ns=time.time_ns(),vk=int(key.vk),key=name,scan=int(key.scan),edge='up' if key.flags&0x80 else 'down',injected=bool(key.flags&0x10),lower_integrity_injected=bool(key.flags&2),os_time_ms=int(key.stamp),hwnd=int(hwnd or 0),pid=int(pid.value)),int(pid.value))

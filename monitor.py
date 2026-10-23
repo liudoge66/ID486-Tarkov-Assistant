@@ -17,12 +17,14 @@ from hotkey_service import Hotkeys, PRESETS as HOTKEY_PRESETS, label as hotkey_l
 from tkinter import font as tkfont
 import winsound
 from collections import deque
-from detector import Detector, Gate, ExtractionGuard, ArmConfirmation, start_hud_evidence
+from detector import Detector, Gate, ExtractionGuard, ArmConfirmation, start_hud_evidence, combat_hud_evidence
 from diagnostics import Diagnostics
 from hud_layout import capture_strip_height
+from esc_title import EscTitleDetector
+from ui_fade import UniformFadeWatch
 from keyboard_diagnostics import KeyboardDiagnostics
-APP_BUILD='2026.10.22-v0.22-local'
-APP_VERSION='V0.22'
+APP_BUILD='2026.10.23-v0.23-hud-consistency-early-esc-fade'
+APP_VERSION='V0.23'
 
 U=C.WinDLL('user32',use_last_error=True)
 K=C.WinDLL('kernel32',use_last_error=True)
@@ -674,17 +676,25 @@ class App:
                         self.event('arm_rejected',reason='首次开启需要战斗HUD，菜单不能单独开启',arm_policy=confirmation.summary(),scores=scores,menu_score=menu_score,
                             frame_size=list(frame.shape[:2]) if frame is not None else None,expected_size=list(shape),features=self.detector.last_features,menu_features=self.detector.last_menu_features,extraction_cues=getattr(self.detector,'last_extraction',{}))
                         self.cancel('未观察到战斗HUD，请在血量人形与快捷栏可见时开启');continue
+                    if hasattr(self.detector,'lock_current_layout'):self.detector.lock_current_layout()
                     self.active=True
                     if getattr(self,'keyboard_diagnostics',None):self.keyboard_diagnostics.start(info[1])
                     self.event('armed',arm_policy=confirmation.summary(),dry_run=dry,scores=scores,menu_score=menu_score,
                         delay_ms=self.gate.delay_ms,capture_hz=hz,capture_region=list(region),features=self.detector.last_features,menu_features=self.detector.last_menu_features,extraction_cues=getattr(self.detector,'last_extraction',{}))
                     self.ui.put(('status','监控中 · '+('只记录，不退出' if dry else '战斗 HUD 和菜单均消失并超过设定延时才退出')))
                 last_new=time.perf_counter();last_ui=0;paused=False;capture_waiting=False;settings_transition=False;next_tick=last_new
+                title_detector=EscTitleDetector();esc_expanded=False;esc_requested=-100.;esc_down=False
+                keyboard=getattr(self,'keyboard_diagnostics',None);esc_serial=getattr(keyboard,'escape_serial',0)
+                esc_mode_reported=None;title_error_reported=False
+                esc_fade=UniformFadeWatch();hud_fade=UniformFadeWatch();ui_transition_until=0.;last_pause_visible=False
+                top_height=capture_strip_height(info[2],info[3])
+                expanded_height=min(info[3],max(top_height,round(info[3]*.47)))
                 def collect(phase,stamp):
                     if diagnostic and self.collect_enabled and hasattr(self.detector,'last_top'):
                         diagnostic.push(self.detector.last_top,dict(monotonic=stamp,wall_time=time.time(),phase=phase,
                             features=dict(self.detector.last_features),menu_features=dict(self.detector.last_menu_features),
                             delay_ms=self.gate.delay_ms,capture_hz=hz,full_size=[info[2],info[3]],
+                            esc_capture_expanded=esc_expanded,capture_region=list(region),
                             absence_ms_before_decision=0 if self.gate.missing_since is None else (stamp-self.gate.missing_since)*1000))
                 while True:
                     with self.lock:
@@ -711,9 +721,22 @@ class App:
                             paused=True
                         time.sleep(.05);last_new=time.perf_counter();continue
                     if paused:
+                        esc_fade.reset();hud_fade.reset();ui_transition_until=time.perf_counter()+.8;last_pause_visible=False
                         self.event('focus_resumed')
                         self.ui.put(('status','监控中 · 已回到游戏，继续判断'))
                         paused=False
+                    # Escape only expands observation; it never means 'menu is present'.
+                    keyboard=getattr(self,'keyboard_diagnostics',None)
+                    serial=getattr(keyboard,'escape_serial',esc_serial)
+                    key_down=bool(U.GetAsyncKeyState(0x1B)&0x8000)
+                    if (serial!=esc_serial and getattr(keyboard,'escape_pid',None)==info[1]) or (key_down and not esc_down):
+                        esc_expanded=True;esc_requested=time.perf_counter();ui_transition_until=esc_requested+.8
+                        esc_fade.reset();hud_fade.reset()
+                        self.event('esc_capture_requested',source='keyboard_edge')
+                    esc_serial=serial;esc_down=key_down
+                    if last_pause_visible and U.GetAsyncKeyState(0x01)&0x8000:ui_transition_until=time.perf_counter()+.8
+                    region=(0,0,info[2],expanded_height if esc_expanded else top_height)
+                    shape=(region[3],info[2])
                     begin=time.perf_counter()
                     frame=camera.grab(region=region,copy=False)
                     now=time.perf_counter();attempts+=1;cap_ms.append((now-begin)*1000)
@@ -741,6 +764,31 @@ class App:
                     # Reacquire layout while guarded; a stale viewport must not imply death.
                     if settings_transition and hasattr(self.detector,'reset_layout'):self.detector.reset_layout()
                     scores,menu_score=self.detector.analyze(frame,full_size=(info[2],info[3]))
+                    combat=self.detector.last_features['combat_score']
+                    title_result=None
+                    if esc_expanded and combat<.48 and menu_score<.55:
+                        try:
+                            title_result=title_detector.detect(frame,(info[2],info[3]),getattr(self.detector,'layout',None))
+                            self.detector.last_menu_features['esc_title']=title_result
+                            if title_result['present']:menu_score=max(menu_score,1.)
+                        except Exception as exc:
+                            if not title_error_reported:self.event('esc_title_error',reason=str(exc));title_error_reported=True
+                            self.cancel('ESC标题检测失败，已停止监控，请查看日志');break
+                    if not esc_expanded and combat<=.22 and menu_score<.55:
+                        # Unknown UI loss gets one expanded fresh-frame examination before Gate.
+                        esc_expanded=True;esc_requested=now
+                        self.event('esc_capture_requested',source='unknown_ui')
+                        self.gate.missing_since=None;self.gate.missing=0
+                        continue
+                    if esc_expanded and combat_hud_evidence(self.detector.last_features) and now-esc_requested>.35:
+                        esc_expanded=False
+                        self.event('esc_capture_restored',layout=self.detector.last_features.get('layout'))
+                    if esc_expanded:
+                        state='menu_visible' if menu_score>=.55 else 'ui_absent'
+                        if state!=esc_mode_reported:
+                            self.event('esc_visual_state',state=state,combat_score=combat,menu_score=menu_score,title=title_result)
+                            esc_mode_reported=state
+                    else:esc_mode_reported=None
                     settings_visible=self.detector.last_menu_features.get('settings',0.)>=.55
                     if settings_visible and not settings_transition:
                         settings_transition=True
@@ -748,7 +796,7 @@ class App:
                         self.event('settings_transition_paused',layout=self.detector.last_features.get('layout'))
                         self.ui.put(('status','监控中 · 设置页面已打开，等待返回战斗画面'))
                     if settings_transition:
-                        if start_hud_evidence(self.detector.last_features) and menu_score<.55:
+                        if combat_hud_evidence(self.detector.last_features) and menu_score<.55:
                             settings_transition=False
                             extraction_guard.reset('settings_transition_resumed')
                             self.gate.missing_since=None;self.gate.missing=0
@@ -757,6 +805,14 @@ class App:
                         else:
                             menu_score=max(menu_score,1.)
                             self.detector.last_menu_features['settings_transition_guard']=True
+                    last_pause_visible=(self.detector.last_menu_features.get('pause',0.)>=.55
+                                        or bool((title_result or {}).get('present')))
+                    suppress_fade=settings_transition or now<ui_transition_until
+                    esc_fade_result=esc_fade.update(now,getattr(self.detector,'last_top',None),'esc' if last_pause_visible else None,suppress_fade)
+                    paired_hud=(self.detector.last_features.get('bar_frames',0)>=.22 and self.detector.last_features.get('label_shape',0)>=.35)
+                    hud_fade_result=hud_fade.update(now,getattr(self.detector,'last_top',None),'combat' if paired_hud and menu_score<.55 else None,suppress_fade)
+                    self.detector.last_menu_features['early_esc_fade']=esc_fade_result
+                    self.detector.last_menu_features['hud_preserving_fade']=hud_fade_result
                     collect('monitoring',now)
                     analysis_ms.append((time.perf_counter()-begin)*1000)
                     if now-last_ui>.2:
@@ -769,13 +825,18 @@ class App:
                             extraction_trace.append(dict(monotonic=now,combat_score=self.detector.last_features['combat_score'],menu_score=menu_score,
                                 cues=dict(getattr(self.detector,'last_extraction',{})),guard=extraction_guard.trace(now)))
                             last_trace_time=now
+                        if not extracted and hud_fade_result['confirmed']:
+                            extracted=True;extraction_guard.last_confirmation=dict(policy='hud_preserving_uniform_fade',**hud_fade_result)
                         if extracted:
                             self.event('extraction_transition',evidence=extraction_guard.last_confirmation,
                                 extraction_cues=getattr(self.detector,'last_extraction',{}),extraction_trace=list(extraction_trace))
                             self.cancel('识别到撤离渐黑过渡，停止监控（未发送 Alt+F4）')
                             break
                         previous_missing=self.gate.missing_since
-                        fired=self.gate.update(scores,menu_present=menu_score>=.55,now=now,combat_score=self.detector.last_features["combat_score"])
+                        fired=self.gate.update(scores,menu_present=menu_score>=.55,now=now,combat_score=self.detector.last_features["combat_score"],features=self.detector.last_features)
+                        if esc_fade_result['confirmed']:
+                            fired=True;self.gate.cancel()
+                            self.event('esc_death_fade_confirmed',evidence=esc_fade_result)
                         if previous_missing is not None and self.gate.missing_since is None and not fired:
                             self.event('absence_reset',combat_score=self.detector.last_features['combat_score'],menu_score=menu_score)
                         if fired:
@@ -922,6 +983,9 @@ if __name__=='__main__':
         app=App()
         if '--smoke-test' in sys.argv:
             import video_test
+            import numpy as np
+            title_probe=EscTitleDetector().detect(np.zeros((540,960,3),dtype=np.uint8),(960,1080))
+            assert not title_probe['present'], 'Blank scene must not be an ESC title'
             import dxcam
             from dxcam.processor.cv2_processor import Cv2Processor
             assert not app.active and not app.arming

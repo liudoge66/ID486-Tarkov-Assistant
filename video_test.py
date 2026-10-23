@@ -7,6 +7,8 @@ from tkinter import filedialog
 import cv2
 from PIL import Image,ImageTk
 from detector import Detector,Gate,ExtractionGuard,ArmConfirmation
+from esc_title import EscTitleDetector
+from ui_fade import UniformFadeWatch
 from video_reader import VideoReader
 
 def run_video_test(path=None,result_path=None):
@@ -25,7 +27,7 @@ def run_video_test(path=None,result_path=None):
     base=Path(os.sys.executable).parent if getattr(os.sys,'frozen',False) else Path(__file__).parent
     folder=base/'video_test_results';folder.mkdir(exist_ok=True)
     prefix=Path(result_path).stem if result_path else source.stem+'_'+str(time.time_ns());report=dict(video=source.name,source_fps=fps,frame_count=total,source_width=cap.get(cv2.CAP_PROP_FRAME_WIDTH),source_height=cap.get(cv2.CAP_PROP_FRAME_HEIGHT),mode='decoded video UI + own player Alt+F4 + WM_CLOSE',delay_ms=300,sample_hz=30,events=[])
-    rows=[];detector=Detector();gate=Gate(delay_ms=300);guard=ExtractionGuard();arm=ArmConfirmation(30)
+    rows=[];detector=Detector();title_detector=EscTitleDetector();esc_fade=UniformFadeWatch();hud_fade=UniformFadeWatch();gate=Gate(delay_ms=300);guard=ExtractionGuard();arm=ArmConfirmation(30)
     label=tk.Label(root,bg='black');label.pack();note=tk.StringVar(value='录像测试 · 自动等待稳定战斗HUD · 只会关闭本播放器')
     tk.Label(root,textvariable=note,bg='#18181c',fg='white',pady=12).pack()
     screen_w=root.winfo_screenwidth();aspect=cap.get(cv2.CAP_PROP_FRAME_WIDTH)/cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
@@ -76,11 +78,22 @@ def run_video_test(path=None,result_path=None):
             t=cap.last_time
             if t+1e-6>=state['next_check']:
                 state['next_check']=t+1/30;scores,menu=detector.analyze(frame);features=detector.last_features
+                if gate.active and features['combat_score']<.48 and menu<.55:
+                    title=title_detector.detect(frame,(frame.shape[1],frame.shape[0]),detector.layout)
+                    detector.last_menu_features['esc_title']=title
+                    if title['present']:menu=max(menu,1.)
                 if not gate.active and not state['extracted'] and arm.update(features,t):
-                    if gate.arm(scores,menu_present=menu>=.55,combat_score=features['combat_score'],features=features):event('armed',video_seconds=t,evidence=arm.summary())
+                    if gate.arm(scores,menu_present=menu>=.55,combat_score=features['combat_score'],features=features):
+                        detector.lock_current_layout();event('armed',video_seconds=t,evidence=arm.summary())
+                esc_present=(detector.last_menu_features.get('pause',0.)>=.55 or detector.last_menu_features.get('esc_title',{}).get('present',False))
+                esc_fade_result=esc_fade.update(t,detector.last_top,'esc' if gate.active and esc_present else None)
+                paired_hud=features['bar_frames']>=.22 and features['label_shape']>=.35
+                hud_fade_result=hud_fade.update(t,detector.last_top,'combat' if gate.active and paired_hud and menu<.55 else None)
                 extracted=guard.update(t,features['combat_score'],menu>=.55,detector.last_extraction) if gate.active else False
+                if hud_fade_result['confirmed']:extracted=True
                 if extracted:state['extracted']=True;gate.cancel();event('extraction',video_seconds=t)
-                fired=gate.update(scores,menu_present=menu>=.55,now=t,combat_score=features['combat_score'])
+                fired=gate.update(scores,menu_present=menu>=.55,now=t,combat_score=features['combat_score'],features=features)
+                if esc_fade_result['confirmed']:fired=True;gate.cancel();event('esc_death_fade',video_seconds=t,evidence=esc_fade_result)
                 rows.append(dict(video_seconds=t,combat=features['combat_score'],body=features['body_shape'],labels=features['label_shape'],menu=menu,layout=json.dumps(detector.layout_info),active=gate.active,trigger=fired,extraction=extracted))
                 if extracted:finish('extraction_protected');return
                 note.set(f'录像测试 {t:.2f}s · HUD {features["combat_score"]:.0%} · 菜单 {menu:.0%} · '+('监测中' if gate.active else '等待稳定HUD' if not state['extracted'] else '撤离保护已停止'))
