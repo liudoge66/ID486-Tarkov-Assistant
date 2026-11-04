@@ -14,9 +14,8 @@ def main():
     parser.add_argument('--output-dir',type=Path)
     parser.add_argument('--dependency-dir',type=Path,action='append',default=[],help='Optional existing Python package directory; normally use a venv.')
     args=parser.parse_args()
-    root=Path(__file__).resolve().parent
-    if root.name=='build_tools':root=root.parent
-    source=root/'TarkovHUDMonitor' if (root/'TarkovHUDMonitor').is_dir() else root
+    root=Path(__file__).resolve().parents[1]
+    source=root/'src'
     output=(args.output_dir or root/'dist').resolve();output.mkdir(parents=True,exist_ok=True)
     work=Path(tempfile.mkdtemp(prefix='id486-v03-build-'))
     stage=work/'stage';stage.mkdir()
@@ -31,8 +30,7 @@ def main():
     for item in (source/'assets').rglob('*'):
         if item.is_file() and item.name not in omit:
             target=assets/item.relative_to(source/'assets');target.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(item,target)
-    version=root/'build_tools/id486_v03_version.txt'
-    if not version.exists():version=root/'version_info.txt'
+    version=root/'scripts/version_info.txt'
     spec=work/'ID486-V0.3.spec'
     spec.write_text(f"""from PyInstaller.utils.hooks import collect_all
 datas = {[(str(assets),'assets')]!r}

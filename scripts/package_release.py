@@ -8,11 +8,11 @@ temporary=tempfile.TemporaryDirectory(prefix='id486-clean-release-')
 PACKAGE=Path(temporary.name)/'ID486-V0.3-Windows'
 PACKAGE.mkdir(parents=True,exist_ok=True)
 shutil.copy2(OUT/'ID486模拟助手.exe',PACKAGE/'ID486模拟助手.exe')
-for name in ('README.md','CHANGELOG.md','THIRD_PARTY_NOTICES.md'):
+for name in ('README.md',):
     shutil.copy2(ROOT/name,PACKAGE/name)
-for folder in ('THIRD_PARTY_LICENSES','docs/images'):
+for folder in ('docs',):
     shutil.copytree(ROOT/folder,PACKAGE/folder,dirs_exist_ok=True)
-shutil.copytree(ROOT/'assets/capture',PACKAGE/'capture-licenses',ignore=shutil.ignore_patterns('*.dll'),dirs_exist_ok=True)
+shutil.copytree(ROOT/'src/assets/capture',PACKAGE/'capture-licenses',ignore=shutil.ignore_patterns('*.dll'),dirs_exist_ok=True)
 archive=OUT/'ID486-V0.3-Windows.zip'
 with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED,compresslevel=9) as z:
     for p in sorted(PACKAGE.rglob('*')):

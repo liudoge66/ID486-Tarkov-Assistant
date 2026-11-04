@@ -19,12 +19,13 @@ jobs:
         with:
           python-version: '3.11'
           cache: pip
+          cache-dependency-path: scripts/requirements*.txt
       - name: Install build dependencies
-        run: python -m pip install -r requirements-build.txt
+        run: python -m pip install -r scripts/requirements-build.txt
       - name: Run synthetic release regressions
         run: python -m unittest discover -s tests -v
       - name: Build live-only executable
-        run: python build.py
+        run: python scripts/build.py
       - name: Verify packaged runtime and excluded video libraries
         shell: python
         run: |
@@ -52,8 +53,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
-          $tag = (Get-Content release.json | ConvertFrom-Json).tag
+          $tag = (Get-Content scripts/release.json | ConvertFrom-Json).tag
           gh release view $tag *> $null
           if ($LASTEXITCODE -eq 0) { throw "Release $tag already exists; refusing to replace assets." }
-          gh release create $tag --target $env:GITHUB_SHA --title 'ID486 模拟助手 V0.3' --notes-file RELEASE_NOTES.md 'dist/ID486-V0.3-Windows.zip' 'dist/SHA256SUMS.txt'
+          gh release create $tag --target $env:GITHUB_SHA --title 'ID486 模拟助手 V0.3' --notes-file docs/RELEASE_NOTES.md 'dist/ID486-V0.3-Windows.zip' 'dist/SHA256SUMS.txt'
           if ($LASTEXITCODE -ne 0) { throw 'Release publication failed.' }

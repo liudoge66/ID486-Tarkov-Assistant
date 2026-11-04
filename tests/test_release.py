@@ -9,7 +9,8 @@ import unittest
 from unittest.mock import patch
 
 ROOT=Path(__file__).resolve().parents[1]
-sys.path.insert(0,str(ROOT))
+SOURCE=ROOT/'src'
+sys.path.insert(0,str(SOURCE))
 from app_storage import load_settings,writable_data_directory
 from detector import Gate,Detector
 from isolation_candidate import IsolationCandidate
@@ -77,12 +78,12 @@ class ReleaseTests(unittest.TestCase):
             self.assertEqual(features,baseline.last_features)
 
     def test_live_only_source_and_syntax(self):
-        for p in ROOT.glob('*.py'):ast.parse(p.read_text(encoding='utf-8-sig'))
-        source=(ROOT/'monitor.py').read_text(encoding='utf-8')
+        for p in SOURCE.glob('*.py'):ast.parse(p.read_text(encoding='utf-8-sig'))
+        source=(SOURCE/'monitor.py').read_text(encoding='utf-8')
         self.assertNotIn('--video-test',source)
         self.assertNotIn('open_video_test',source)
-        self.assertNotIn('open_video_test',(ROOT/'primary_ui.py').read_text(encoding='utf-8'))
-        self.assertNotIn('av==',(ROOT/'requirements.txt').read_text())
+        self.assertNotIn('open_video_test',(SOURCE/'primary_ui.py').read_text(encoding='utf-8'))
+        self.assertNotIn('av==',(ROOT/'scripts/requirements.txt').read_text())
 
 
 if __name__=='__main__':unittest.main()

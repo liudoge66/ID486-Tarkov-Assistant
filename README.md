@@ -2,6 +2,8 @@
 
 # ID486 模拟助手
 
+<img src="docs/images/logo.png" width="112" height="112" alt="ID486 软件图标">
+
 ### V0.3 · 观察画面，自动响应
 
 适用于本地PvE战局的一个大退(Alt F4)小工具
@@ -11,9 +13,9 @@
 ![Capture](https://img.shields.io/badge/capture-SDR_%2F_HDR-38bdf8?style=flat-square)
 ![Mode](https://img.shields.io/badge/mode-local_PvE-34d399?style=flat-square)
 
-**[下载 V0.3](https://github.com/liudoge66/ID486-Tarkov-Assistant/releases/tag/v0.3)** · [快速使用](#快速使用) · [场景处理](#不同场景如何处理) · [技术方案](#当前技术方案) · [更新记录](CHANGELOG.md)
+**[下载 V0.3](https://github.com/liudoge66/ID486-Tarkov-Assistant/releases/tag/v0.3)** · [快速使用](#快速使用) · [场景处理](#不同场景如何处理) · [技术方案](#当前技术方案) · [更新记录](docs/CHANGELOG.md)
 
-<img src="docs/images/interface-dark.png" width="360" alt="V0.3 深色界面">&nbsp;&nbsp;<img src="docs/images/interface-light.png" width="360" alt="V0.3 浅色界面">
+<img src="docs/images/interface-dark.png" width="360" alt="V0.3 深色界面">
 
 </div>
 
@@ -121,13 +123,13 @@ Windows x64、Python 3.11，运行：
 
 ```powershell
 py -3.11 -m venv .venv
-.\.venv\Scripts\python -m pip install -r requirements-build.txt
+.\.venv\Scripts\python -m pip install -r scripts/requirements-build.txt
 .\.venv\Scripts\python -m unittest discover -s tests
-.\build.ps1
+.\scripts\build.ps1
 ```
 
-打包脚本自动编译原生联网助手，需要 Windows 自带的 .NET Framework C# 编译器。仓库附带 HDR 采集 DLL；其 Rust 源码、锁定依赖和重建方法位于 [native/hdr_capture](native/hdr_capture/BUILD.md)。构建不依赖开发者的旧目录，也不安装录像解码库。
+打包脚本自动编译原生联网助手，需要 Windows 自带的 .NET Framework C# 编译器。仓库附带 HDR 采集 DLL；其 Rust 源码、锁定依赖和重建方法位于 [src/native/hdr_capture](src/native/hdr_capture/BUILD.md)。构建不依赖开发者的旧目录，也不安装录像解码库。
 
 ## 权利与许可
 
-非官方工具，与游戏开发商及素材权利人无隶属或授权关系。内嵌音效、字体、同人图像及第三方组件的权利归各自权利人；许可与来源见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)、`THIRD_PARTY_LICENSES`、`assets/capture` 及对应素材说明。
+非官方工具，与游戏开发商及素材权利人无隶属或授权关系。内嵌音效、字体、同人图像及第三方组件的权利归各自权利人；许可与来源见 [第三方许可说明](docs/THIRD_PARTY_NOTICES.md)、`docs/licenses`、`src/assets/capture` 及对应素材说明。
