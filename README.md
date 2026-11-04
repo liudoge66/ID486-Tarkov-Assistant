@@ -4,7 +4,7 @@
 
 ### V0.3 · 观察画面，自动响应
 
-本地 PvE 战局的 Windows 视觉监控工具
+适用于本地PvE战局的一个大退(Alt F4)小工具
 
 ![Version](https://img.shields.io/badge/version-0.3-8b7cf8?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Windows_x64-0078D4?style=flat-square)
