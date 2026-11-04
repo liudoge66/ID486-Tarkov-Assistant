@@ -1,9 +1,6 @@
 name: Build and publish Windows release
 
 on:
-  push:
-    branches: [main]
-    paths: [release.json]
   workflow_dispatch:
 
 permissions:
