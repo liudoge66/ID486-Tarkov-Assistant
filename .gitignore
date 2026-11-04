@@ -19,3 +19,12 @@ keyboard_diagnostics/
 video_test_results/
 sound_settings.json
 hotkey_settings.json
+数据/
+PMC数据/
+Fence数据/
+network_runtime/
+esc_diagnostics/
+运行记录.txt
+candidate_network_events.jsonl
+quick_check_events.jsonl
+*.tmp

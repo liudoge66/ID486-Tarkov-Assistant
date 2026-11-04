@@ -14,6 +14,7 @@ class Control:
     action:object=None
     enabled:bool=True
 
+from edition import FENCE, NETWORK, EDITION
 from dropdowns import Dropdowns
 from volume_control import VolumeControl
 
@@ -30,6 +31,11 @@ class PrimaryUI(VolumeControl,Dropdowns):
         self.card=self.pixel(self.reference,500,680);self.field=self.pixel(self.reference,1000,520)
         self.dark=self.reference.copy();d=ImageDraw.Draw(self.dark)
         for r in ((142,667,418,701),(140,1362,444,1396)):self.fill(d,r,self.card)
+        # Remove the reference's sample volume and saved indicators; paint live controls.
+        for rect in ((140,578,702,610),(975,356,1288,434)):
+            if rect[1]==578 or not FENCE:self.fill(d,rect,self.card)
+        self.fill(d,(970,394,1290,438),self.card)
+        self.fill(d,(534,1770,854,1815),self.pixel(self.reference,700,1750))
         self.light=self.lighten(self.dark)
         self.canvas=tk.Canvas(app.root,highlightthickness=0,bd=0,bg='#111115',takefocus=True);self.canvas.pack(fill='both',expand=True)
         self.canvas_item=self.canvas.create_image(0,0,anchor='nw')
@@ -38,7 +44,7 @@ class PrimaryUI(VolumeControl,Dropdowns):
         self.previous_source=None;self.display_pil=None;self.previous_moving=False;self.previous_theme=None;self.border_cache={}
         for event,fn in [('<Configure>',lambda e:self.schedule()),('<Button-1>',self.mouse_down),('<ButtonRelease-1>',self.mouse_up),('<Motion>',self.motion),('<Leave>',self.leave),('<Tab>',self.tab),('<Shift-Tab>',lambda e:self.tab(e,-1)),('<Return>',self.activate),('<space>',self.activate),('<FocusOut>',self.focus_out)]:self.canvas.bind(event,fn)
         for key in ('<Left>','<Right>','<Home>','<End>'):self.canvas.bind(key,self.volume_key)
-        for v in (app.status,app.bottom_status,app.state_head,app.key_label,app.dry,app.return_sound,app.mute_var,app.sound_on_var,app.sound_off_var,app.delay_text,app.hz_text,app.collect_var,app.log_var):v.trace_add('write',lambda *args:self.schedule())
+        for v in (app.status,app.bottom_status,app.state_head,app.key_label,app.dry,app.return_sound,app.mute_var,app.sound_on_var,app.sound_off_var,app.delay_text,app.hz_text,app.collect_var,app.log_var,app.network_var,app.network_status):v.trace_add('write',lambda *args:self.schedule())
         for k,v in (('prep',app.prep_feedback),('advanced',app.advanced_feedback)):v.trace_add('write',lambda *args,k=k,v=v:self.notice_changed(k,v))
         s=min(.72,(app.root.winfo_screenwidth()-100)/1320,(app.root.winfo_screenheight()-130)/1758)
         app.root.geometry(f'{round(1320*s)}x{round(1758*s)}');app.root.minsize(round(1320*min(s,.42)),round(1758*min(s,.42)));app.root.resizable(True,True);self.schedule()
@@ -74,7 +80,7 @@ class PrimaryUI(VolumeControl,Dropdowns):
                 if isinstance(k,tuple):del self.tiles[k]
         self.tiles[key]=im;return im
     def mode_caption(self,color):
-        return self.colored(self.tile('actual_mode_caption'),color)
+        return self.text_tile('确认执行  判定死亡后直接结束游戏进程',22,color,maxwidth=700)
 
     @staticmethod
     def colored(tile,color):
@@ -134,7 +140,7 @@ class PrimaryUI(VolumeControl,Dropdowns):
         self.paste(im,self.text_tile('大退音效',24,fg),143,465)
         self.paste(im,self.text_tile(getattr(self.app,'version_label',''),14,mix((85,85,93),(119,113,125),theme),en=True),698,201)
         self.draw_segment(im,'preview',(143,509,253,572),self.preview,theme);self.draw_segment(im,'check',(730,508,943,572),self.check_hotkey,theme)
-        for name,r,default,value in [('audio_value',(250,508,665,572),'原版死亡回归',self.app.sounds.selected['exit'] or '无音效'),('hotkey_value',(940,508,1253,572),'F10',self.app.key_name),('delay_value',(828,1077,920,1138),'300',self.app.delay_text.get()),('hz_value',(1180,1077,1255,1138),'30',self.app.hz_text.get())]:
+        for name,r,default,value in [('audio_value',(250,508,665,572),'原版死亡回归',self.app.sounds.selected['exit'] or '无音效'),('hotkey_value',(940,508,1253,572),'F10',self.app.key_name),('delay_value',(856,952,948,1012),'300',self.app.delay_text.get()),('hz_value',(1180,952,1255,1012),'30',self.app.hz_text.get())]:
             self.fill(d,(r[0]+2,r[1]+3,r[2]-2,r[3]-3),field)
             tile=self.dropdown_text('RE0死亡回归(默认)' if name=='audio_value' and value=='原版死亡回归' else value,muted,name!='audio_value' and value!='未设置',r[2]-r[0]-(75 if name in ('audio_value','hotkey_value') else 20))
             if theme>0:tile=self.colored(tile,muted)
@@ -149,11 +155,12 @@ class PrimaryUI(VolumeControl,Dropdowns):
                     self.control('delete_selected_key',(r[2]-45,r[1],r[2],r[3]),lambda:self.delete_key(self.app.hotkey_service.combo))
             else:
                 self.centered(im,tile,r);self.control(name,r,lambda k='delay' if name=='delay_value' else 'hz':self.toggle_dropdown(k))
-        for key,r,kind in [('audio_arrow',(665,508,699,572),'audio'),('key_arrow',(1253,508,1286,572),'key'),('delay_arrow',(920,1077,951,1138),'delay'),('hz_arrow',(1255,1077,1286,1138),'hz')]:
+        for key,r,kind in [('audio_arrow',(665,508,699,572),'audio'),('key_arrow',(1253,508,1286,572),'key'),('delay_arrow',(948,952,979,1012),'delay'),('hz_arrow',(1255,952,1286,1012),'hz')]:
             self.control(key,r,lambda k=kind:self.toggle_dropdown(k))
         self.draw_save(im,'save_prep',(1058,651,1285,708),self.app.save_preparation,theme);self.draw_save(im,'save_advanced',(1059,1344,1285,1401),self.app.save_advanced,theme)
         mute=self.tween('disabled_audio',float(self.app.mute_var.get()))
-        for key,var in [('sound_on',self.app.sound_on_var),('sound_off',self.app.sound_off_var),('sound_exit',self.app.return_sound),('mute',self.app.mute_var),('screenshots',self.app.collect_var),('logs',self.app.log_var),('dry',self.app.dry)]:
+        for key,var in [('sound_on',self.app.sound_on_var),('sound_off',self.app.sound_off_var),('sound_exit',self.app.return_sound),('mute',self.app.mute_var),('network',self.app.network_var),('screenshots',self.app.collect_var),('logs',self.app.log_var),('dry',self.app.dry)]:
+            if key=='network' and not NETWORK:continue
             disabled=mute if key in ('sound_on','sound_off','sound_exit') else 0.;enabled=not (key in ('sound_on','sound_off','sound_exit') and self.app.mute_var.get())
             self.draw_switch(im,key,var,theme,disabled,enabled)
         if theme<.01:
@@ -161,14 +168,27 @@ class PrimaryUI(VolumeControl,Dropdowns):
                 r=self.meta[key]['bbox'];tile=self.tile(key).convert('RGB')
                 if mute:tile=Image.blend(tile,Image.new('RGB',tile.size,card),mute*.5)
                 im.paste(tile,(r[0]-60,r[1]-81))
+        if FENCE:
+            self.fill(d,(140,1072,520,1145),card)
+            self.paste(im,self.text_tile('保存全屏截图/收集日志',24,fg),144,1079)
+            self.paste(im,self.text_tile('Save Full Screenshot / Collect Logs',18,muted,en=True),146,1119)
+        if NETWORK:
+            # Preserve the PSD font/size; field and switch share one binary action.
+            r=self.meta['network_label']['bbox'];self.paste(im,self.colored(self.tile('network_label'),fg),r[0],r[1])
+            self.control('network_settings',(975,352,1220,392),self.app.toggle_network)
         self.draw_notices(im,card,muted);self.draw_status(im,card,fg,muted)
-        for key,r,title,fn in [('video_test',(534,1770,854,1815),'录像测试',self.app.open_video_test),('open_log',(140,1770,290,1815),'打开日志',self.app.open_log),('stop',(1100,1770,1300,1815),'停止监控',lambda:self.app.cancel('手动停止'))]:
+        if NETWORK and (self.app.network_var.get() or self.app.network_status.get()!='联网控制未开启'):
+            self.fill(d,(740,398,1288,438),card)
+            tile=self.network_status_tile(self.app.network_status.get(),muted)
+            self.paste(im,tile,1284-tile.width,410)
+        for key,r,title,fn in [('open_log',(140,1770,290,1815),'打开日志',self.app.open_log),('stop',(1100,1770,1300,1815),'停止监控',self.app.stop_all)]:
+            self.fill(d,r,self.pixel(self.reference,700,1750))
             self.control(key,r,fn);h=self.tween('hover:'+key,float(self.hover_key==key),.12);self.centered(im,self.text_tile(title,21,mix(muted,fg,h)),r)
         self.draw_volume(im,muted)
         if self.dropdown or self.dropdown_paint:
             self.draw_dropdown(im,theme)
         if self.dropdown:
-            ar={'audio':(665,508,699,572),'key':(1253,508,1286,572),'delay':(920,1077,951,1138),'hz':(1255,1077,1286,1138)}[self.dropdown]
+            ar={'audio':(665,508,699,572),'key':(1253,508,1286,572),'delay':(948,952,979,1012),'hz':(1255,952,1286,1012)}[self.dropdown]
             self.fill(ImageDraw.Draw(im),(ar[0]+3,ar[1]+4,ar[2]-3,ar[3]-4),(255,255,255))
             cx=(ar[0]+ar[2])//2;cy=(ar[1]+ar[3])//2
             ImageDraw.Draw(im).polygon([(cx-7-60,cy+5-81),(cx+7-60,cy+5-81),(cx-60,cy-7-81)],fill=(32,32,36))
@@ -195,8 +215,9 @@ class PrimaryUI(VolumeControl,Dropdowns):
             self.canvas.configure(bg=self.palette()['bg'])
         else:
             regions=[c.rect for c in self.controls.values()]
-            regions += [(250,508,700,900),(940,508,1287,845),(825,1077,952,1305),(1178,1077,1287,1305)]
+            regions += [(250,508,700,900),(940,508,1287,845),(825,952,952,1179),(1178,952,1287,1179)]
             regions += [(140,575,705,612)]
+            regions += [(975,352,1288,394),(740,398,1290,438)]
             regions += [(138,664,1036,705),(138,1358,1036,1403),(96,1479,1331,1739)]
             regions += [self.meta[k]['bbox'] for k in ('on_label','off_label','exit_label')]
             changed=False;settling=self.previous_moving and not self.moving
@@ -230,9 +251,22 @@ class PrimaryUI(VolumeControl,Dropdowns):
             name=key+'_'+part;b=self.meta[name]['bbox'];tile=self.tile(name)
             if theme:tile=self.colored(tile,mix((255,255,255),(36,34,42),theme))
             self.paste(im,tile,b[0],b[1])
+    def network_status_tile(self,text,color):
+        # Keep the established font size; long diagnostics belong in the log.
+        text=' '.join(str(text).split());shown=text;tile=self.text_tile(shown,16,color)
+        if tile.width>540:
+            low,high=0,len(text)
+            while low<high:
+                middle=(low+high+1)//2
+                if self.text_tile(text[:middle]+'…',16,color).width<=540:low=middle
+                else:high=middle-1
+            shown=text[:low]+'…';tile=self.text_tile(shown,16,color)
+        self.visible_network_status=shown
+        return tile
     def draw_switch(self,im,key,var,theme,disabled,enabled):
         meta=self.meta['switch_'+key];r=tuple(meta['rect']);region=meta['region']
         def change():
+            if key=='network':self.app.toggle_network();return
             var.set(not var.get())
             if key!='dry':self.app.advanced_feedback.set('尚未保存')
         self.control(key,(r[0]-5,r[1]-7,r[2]+5,r[3]+7),change,enabled);value=self.tween('switch:'+key,float(var.get() and not (key in ('sound_on','sound_off','sound_exit') and self.app.mute_var.get())),.18)
@@ -262,7 +296,9 @@ class PrimaryUI(VolumeControl,Dropdowns):
         if state!='未启动':self.fill(d,(140,1521,1047,1602),card);self.paste(im,self.text_tile('当前状态：'+state,60,color,maxwidth=900),145,1530)
         if self.app.key_name!='F10' or not self.app.hotkeys or state!='未启动':
             self.fill(d,(140,1607,1044,1648),card);caption=self.app.status.get() if state!='未启动' or not self.app.hotkeys else f'进入战局后，请在左上角人物血量HUD可见后按{self.app.key_name}';self.paste(im,self.text_tile(caption,24,color,maxwidth=900),145,1616)
-        if not self.app.dry.get():self.fill(d,(332,1661,1045,1702),card);self.paste(im,self.mode_caption(muted),334,1667)
+        self.fill(d,(332,1661,1045,1702),card)
+        caption='仅记录死亡候选，不执行大退' if self.app.dry.get() else '确认执行  判定死亡后直接结束游戏进程'
+        self.paste(im,self.text_tile(caption,22,muted,maxwidth=700),334,1667)
 
     def draw_status_border(self,im,color):
         key=(color,self.theme)
@@ -277,6 +313,7 @@ class PrimaryUI(VolumeControl,Dropdowns):
         r=self.meta['status_border']['bbox'];self.paste(im,self.border_cache[key],r[0],r[1])
     def current_state(self,p):
         status=self.app.bottom_status.get()
+        if self.app.active and status.startswith('转移中'):return ('转移等待中','#BB9B5D')
         if self.app.active:return ('已暂停' if '暂停' in status else '监控中','#6DAE8A')
         if self.app.arming:return ('正在连接','#BB9B5D')
         if status.startswith('录像测试中'):return ('录像测试中','#BB9B5D')

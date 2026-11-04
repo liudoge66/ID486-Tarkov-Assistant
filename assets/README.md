@@ -1,3 +1,3 @@
 Runtime visual references and nonofficial fan-art assets.
 
-return_by_death.wav is the user-selected anime audio, embedded in the EXE. Automatic playback occurs only after an actual Alt+F4 send; manual preview is available. Rights remain with the original rights holders.
+Audio, fonts and fan-art are embedded runtime resources. Automatic exit feedback follows an accepted death/exit action; manual previews remain available. Rights remain with the original rights holders. V0.3 uses a verified process handle for direct termination and retains controlled fallback paths.

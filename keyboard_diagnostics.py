@@ -4,6 +4,7 @@ from ctypes import wintypes as W
 from collections import deque,Counter
 from pathlib import Path
 import json,threading,time
+from datetime import datetime
 
 class EventWindow:
     def __init__(self,seconds=15,limit=20000):
@@ -39,12 +40,15 @@ class EventWindow:
             return out
 
 class KeyboardDiagnostics:
-    def __init__(self,folder):
+    def __init__(self,folder,record=True):
+        self.record=record
         self.escape_serial=0;self.escape_pid=None;self.window=EventWindow();self.folder=Path(folder);self.stop=threading.Event();self.ready=threading.Event();self.available=False;self.error=None
         self.max_callback_ms=0.;self.callback_count=0;self.thread=threading.Thread(target=self.run,daemon=True);self.thread.start();self.ready.wait(2)
     def start(self,pid):self.window.start(pid)
     def pause(self):self.window.pause()
-    def trigger(self,pid,metadata):return self.window.trigger(time.perf_counter(),pid,metadata)
+    def trigger(self,pid,metadata):
+        if self.record:return self.window.trigger(time.perf_counter(),pid,metadata)
+        self.pause();return False
     def run(self):
         u=C.WinDLL('user32',use_last_error=True);k=C.WinDLL('kernel32',use_last_error=True)
         PTR=C.c_ssize_t
@@ -68,6 +72,7 @@ class KeyboardDiagnostics:
                     key=C.cast(ptr,C.POINTER(Key)).contents
                     if key.vk==0x1B and not key.flags&0x90 and self.window.armed and int(pid.value)==self.window.pid:
                         self.escape_pid=int(pid.value);self.escape_serial+=1
+                    if not self.record:return u.CallNextHookEx(None,code,msg,ptr)
                     names={0xA0:'LShift',0xA1:'RShift',0xA2:'LCtrl',0xA3:'RCtrl',0xA4:'LAlt',0xA5:'RAlt',0x5B:'LWin',0x5C:'RWin',0x73:'F4'}
                     name=names.get(key.vk,('F'+str(key.vk-0x6F)) if 0x70<=key.vk<=0x87 else ('VK_%02X'%key.vk))
                     self.window.add(dict(t=begin,wall_ns=time.time_ns(),vk=int(key.vk),key=name,scan=int(key.scan),edge='up' if key.flags&0x80 else 'down',injected=bool(key.flags&0x10),lower_integrity_injected=bool(key.flags&2),os_time_ms=int(key.stamp),hwnd=int(hwnd or 0),pid=int(pid.value)),int(pid.value))
@@ -89,6 +94,7 @@ class KeyboardDiagnostics:
             self.folder.mkdir(parents=True,exist_ok=True)
             counts=Counter();held=set()
             for e in item['events']:
+                e['timestamp']=datetime.fromtimestamp(e['wall_ns']/1e9).astimezone().isoformat(timespec='milliseconds')
                 e['relative_ms']=round((e['t']-item['trigger_t'])*1000,3)
                 pair=(e['vk'],e['injected']);repeat=e['edge']=='down' and pair in held;e['repeat']=repeat
                 counts[e['key']+':'+e['edge']+(':injected' if e['injected'] else ':hardware')]+=1
@@ -96,6 +102,7 @@ class KeyboardDiagnostics:
                 if e['edge']=='down':held.add(pair)
                 else:held.discard(pair)
             item['summary']=dict(counts);item['scope']='only foreground target PID; no text translation; prior 15s + following 15s'
+            item['trigger_timestamp']=datetime.fromtimestamp(item['trigger_wall_ns']/1e9).astimezone().isoformat(timespec='milliseconds')
             item['repeat_note']='repeat inferred within retained window; state before window may be unknown'
             item['hook_metrics']=dict(callback_count=self.callback_count,max_callback_ms=self.max_callback_ms)
             name='keyboard_'+str(time.time_ns())+'.json';tmp=self.folder/(name+'.tmp');tmp.write_text(json.dumps(item,ensure_ascii=False,indent=2),encoding='utf-8');tmp.replace(self.folder/name)

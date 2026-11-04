@@ -1,0 +1,1 @@
+HDR capture derived from 1003129155/jietuba, commit 5eb635bd88eab96c1a3bd4273478ce15e161541b (MIT). DXGI modules derived from NiiightmareXD/windows-capture c7d106448eb9d9b251345c39047711e1cd408ae2 (MIT). ID486 changes: C ABI, source QPC/cache provenance, display generation and HDR/WCG distinction. Static GPU mapping only.

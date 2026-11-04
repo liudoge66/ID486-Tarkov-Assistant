@@ -1,9 +1,19 @@
+from relative_fade import RelativeFadeWatch
+from hsv_fade import HsvFadeWatch
+from dark_trend import DarkTrendWatch
 """Visual-only HUD detector. No keyboard or process APIs."""
 from pathlib import Path
 import time
 import cv2
 import numpy as np
 from timer_digits import TimerDigits
+from center_extraction import CenterExtractionTimer
+from candidate_world import preview as candidate_world_preview
+from inventory_ui import InventoryUI
+from settings_ui import SettingsUI
+from interaction_ui import InteractionUI
+from visual_absence import black_scene
+from parallel_review import review_ui
 from hud_layout import candidates as layout_candidates,project as project_layout
 cv2.setNumThreads(1)
 
@@ -27,7 +37,8 @@ class ArmConfirmation:
                     requires='any: combat >= .48 OR body >= .45 OR bar frames >= .22 OR label edges >= .35')
 
 class Detector:
-    def __init__(self, asset_dir=None):
+    def __init__(self, asset_dir=None, *, parallel_ui=True):
+        self.parallel_ui=parallel_ui;self.last_parallel=dict(used=False)
         root = Path(asset_dir or Path(__file__).parent / 'assets')
         self.masks = [cv2.imread(str(root / n), 0) for n in ('health.png', 'bar.png')]
         if any(m is None or np.count_nonzero(m) < 20 for m in self.masks):
@@ -53,44 +64,378 @@ class Detector:
         self.labels=cv2.imread(str(root/'label_shape.png'),0)
         if any(x is None for x in (self.bar_h,self.bar_v,self.labels)):raise ValueError('Shape references missing')
         self.last_features={}
+        self.inventory_ui=InventoryUI(root);self.last_inventory={};self.settings_ui=SettingsUI(root);self.observe_settings=False
+        self.interaction_ui=InteractionUI(root);self.last_interaction={}
+        self.center_timer=CenterExtractionTimer(root,self.settings_ui.numbers)
         self.reset_layout()
 
     def reset_layout(self):
+        self.extraction_full_until=0.;self.center_preferred_until=0.;self.center_scan_time=None;self.center_frame_key=None;self.center_frame_result=None
+        self.center_timer.reset()
+        self.relative_watch=RelativeFadeWatch();self.hsv_watch=HsvFadeWatch();self.dark_watch=DarkTrendWatch();self.relative_context=None
         self.layout=None;self.layout_info={};self.menu_top=None;self.extraction_top=None
+        self._esc_track=None;self.last_esc_fast=dict(used=False,reason='reset')
+        self._combat_layout=None;self.last_death_fast=dict(used=False,reason='reset')
+
+    def prepare_full_review(self):
+        # Keep only the expiring live references. Prior negative UI review and
+        # temporal proof cannot authorize anything in the expanded scope.
+        self.relative_watch.reset_proof('capture_scope_expanded')
+        self.hsv_watch.clear_proof('capture_scope_expanded')
+        self.hsv_watch.started=None;self.hsv_watch.baseline=None
+        self.dark_watch.restart_observation('capture_scope_expanded')
+
+    def known_combat_black_frame(self,frame,full_size):
+        """Only accelerate an observation; the shared engine still decides."""
+        self.last_death_fast=dict(used=False,reason='no_combat_layout');self._same_frame_menu=None;self._same_frame_proj=None
+        layout=self._combat_layout
+        if not layout or (layout['width'],layout['height'])!=tuple(full_size):return None
+        if frame.shape[0]<full_size[1] or frame.shape[1]<full_size[0]:
+            self.last_death_fast['reason']='incomplete_frame';return None
+        top,menu,extract,info=project_layout(frame,layout)
+        self._same_frame_proj=(id(frame),dict(layout),top,menu,extract,dict(info))
+        scores=self.scores_top(top)
+        if start_hud_evidence(self.last_features):
+            self.last_death_fast['reason']='hud_visible';return None
+        menu_score=self.menu_score_top(menu)
+        self._same_frame_menu=(id(frame),menu.copy(),menu_score,dict(self.last_menu_features))
+        if menu_score>=.55:
+            self.last_death_fast['reason']='menu_visible';return None
+        scene=black_scene(frame,full_size,layout)
+        if not scene['certified']:
+            self.last_death_fast=dict(used=False,reason=scene['reason'],scene=scene);return None
+        self.layout_recovery=None;self.layout_info=info;self.menu_layout_info=info
+        self.last_top=top;self.menu_top=menu;self.extraction_top=extract
+        self.last_features['layout']=dict(info);self.last_extraction=self.extraction_features(extract)
+        self.last_inventory=dict(observed=False,complete=False,present=False,popup_count=0,certified_black=True)
+        self.last_interaction=dict(observed=True,steam=False,btr=False,certified_black=True)
+        self.last_menu_features.update(inventory_ui=self.last_inventory,
+            settings_ui=dict(observed=False,graphics=False,display_changed=False,apply_box=None,countdown=None))
+        self._esc_track=None;self.last_esc_fast=dict(used=False,reason='black_scene')
+        self.last_death_fast=dict(used=True,reason='certified_black_scene',scene=scene)
+        return scores,menu_score
+
+    @staticmethod
+    def esc_preview(frame):
+        # Fixed-size scene evidence, independent of display brightness. This is
+        # only a shortcut eligibility check, never menu or death evidence.
+        h,w=frame.shape[:2]
+        ys=np.linspace(0,h-1,90,dtype=np.int32);xs=np.linspace(0,w-1,160,dtype=np.int32)
+        return cv2.cvtColor(frame[ys[:,None],xs[None,:],:3],cv2.COLOR_BGR2GRAY).astype('float32')
+
+    def confirmed_esc_frame(self,frame,full_size):
+        track=self._esc_track
+        self.last_esc_fast=dict(used=False,reason='no_confirmed_esc')
+        if not track:return None
+        if tuple(full_size)!=track['size'] or frame.shape[0]<full_size[1]-2:
+            self.last_esc_fast['reason']='capture_changed';return None
+        current=self.esc_preview(frame);base=track['preview'];mask=base>24
+        if np.count_nonzero(mask)<300:
+            self.last_esc_fast['reason']='insufficient_scene';return None
+        gain=float(np.median(current[mask]/(base[mask]+.001)))
+        error=np.abs(current-gain*base)
+        # A new settings page or item window must take the full path. Uniform
+        # fading is allowed here, but fresh logo evidence is still required below.
+        if not .15<=gain<=1.8 or float(np.percentile(error,95))>10 or float(np.mean(error>18))>.015:
+            self.last_esc_fast['reason']='scene_changed';return None
+        top,_,extract,info=project_layout(frame,track['combat_layout'])
+        _,menu,_,menu_info=project_layout(frame,track['menu_layout'])
+        scores=self.scores_top(top)
+        if start_hud_evidence(self.last_features):
+            self.last_esc_fast['reason']='hud_returned';return None
+        score=self.menu_score_top(menu);features=self.last_menu_features
+        if features.get('pause',0)<.55 or max(features.get(k,0) for k in ('inventory','settings','confirmation','console'))>=.55:
+            self.last_esc_fast['reason']='anchors_changed';return None
+        # Keep the original full Steam/BTR recognizer on EVERY fast frame.
+        # A dimmed game logo can remain visible beneath the Steam overlay.
+        interaction=self.interaction_ui.detect(frame,full_size,info)
+        self.layout_recovery=None;self.layout_info=info;self.menu_layout_info=menu_info
+        self.last_top=top;self.menu_top=menu;self.extraction_top=extract
+        self.last_features['layout']=dict(info);self.last_extraction=self.extraction_features(extract)
+        self.last_inventory=dict(observed=False,complete=False,present=False,popup_count=0,skipped_for_esc=True)
+        self.last_interaction=interaction
+        if interaction.get('steam') or interaction.get('btr'):
+            self._esc_track=None
+            self.last_menu_features=dict(interaction_ui=interaction,inventory=0.,settings=0.,pause=0.,confirmation=0.)
+            self.last_esc_fast=dict(used=True,reason='interaction_override');return scores,1.
+        features['inventory_ui']=self.last_inventory
+        features['settings_ui']=dict(observed=False,graphics=False,display_changed=False,apply_box=None,countdown=None,skipped_for_esc=True)
+        track['preview']=current
+        self.last_esc_fast=dict(used=True,reason='fresh_esc_anchors',gain=round(gain,4))
+        return scores,score
+
+    def remember_esc(self,frame,full_size):
+        f=self.last_menu_features;settings=f.get('settings_ui',{})
+        if (frame.shape[0]>=full_size[1]-2 and f.get('pause',0)>=.55 and
+            max(f.get(k,0) for k in ('inventory','settings','confirmation','console'))<.55 and
+            not self.last_inventory.get('present') and not settings.get('graphics') and
+            settings.get('countdown') is None and not settings.get('display_changed') and
+            not self.last_interaction.get('steam') and not self.last_interaction.get('btr')):
+            self._esc_track=dict(size=tuple(full_size),preview=self.esc_preview(frame),
+                combat_layout={k:self.layout_info[k] for k in ('left','right','top','width','height')},
+                menu_layout={k:self.menu_layout_info[k] for k in ('left','right','top','width','height')})
 
     def normalize_top(self,frame,full_size=None):
         h,w=frame.shape[:2];full_size=full_size or (w,h)
+        self.layout_recovery=None
         if self.layout is not None and (self.layout['width'],self.layout['height'])!=tuple(full_size):self.reset_layout()
+        current=None
         if self.layout is not None:
-            top,self.menu_top,self.extraction_top,self.layout_info=project_layout(frame,self.layout)
-            return top
-        best=None
+            proj=getattr(self,'_same_frame_proj',None)
+            if proj is not None and proj[0]==id(frame) and proj[1]==self.layout:
+                top,menu,extract,info=proj[2],proj[3],proj[4],dict(proj[5])
+            else:
+                top,menu,extract,info=project_layout(frame,self.layout)
+            self.scores_top(top)
+            current=(self.last_features['combat_score'],top,menu,extract,info,self.layout,dict(self.last_features))
+            # A good lock remains fixed. Weak locks can be corrected only by a
+            # substantially better, independently matched battle HUD in this frame.
+            if self.layout_hud_evidence(self.last_features):
+                self.menu_top=menu;self.extraction_top=extract;self.layout_info=info
+                return top
+        best=current
         for layout in layout_candidates(frame,full_size):
+            if current is not None and layout==self.layout:continue
             top,menu,extract,info=project_layout(frame,layout)
             self.scores_top(top)
-            score=self.last_features['combat_score']
-            if best is None or score>best[0]:best=(score,top,menu,extract,info,layout,dict(self.last_features))
-            if combat_hud_evidence(self.last_features):break
+            score=self.last_features['combat_score'];feature=dict(self.last_features)
+            if current is not None:
+                if not self.layout_hud_evidence(feature) or score<current[0]+.10:continue
+            if best is None or score>best[0]:best=(score,top,menu,extract,info,layout,feature)
         _,top,self.menu_top,self.extraction_top,self.layout_info,layout,feature=best
-        if combat_hud_evidence(feature):self.layout=layout
+        if current is not None and layout!=self.layout:
+            self.layout_recovery=dict(previous=dict(self.layout),corrected=dict(layout),
+                                      previous_score=round(current[0],4),corrected_score=round(best[0],4))
+            self.layout=layout
+        elif self.layout_hud_evidence(feature):self.layout=layout
         return top
+
+    @staticmethod
+    def layout_hud_evidence(features):
+        return (features.get('combat_score',0)>=.48 and features.get('bar_frames',0)>=.22
+                and features.get('label_shape',0)>=.35)
 
     def lock_current_layout(self):
         if self.layout is None and self.layout_info:
             self.layout={key:self.layout_info[key] for key in ('left','right','top','width','height')}
 
     def analyze(self, frame, full_size=None):
+        context=self.relative_context;hsv_stats=None;dark_stats=None;pending_dark=None;pending_dark_key=None
+        self.last_relative_fade=dict(certified=False,reason='not_enabled')
+        size=full_size or (frame.shape[1],frame.shape[0])
+        full=frame.shape[:2]==(size[1],size[0])
+        self.last_world_gray=None
+        self.last_candidate_world_gray=candidate_world_preview(frame,self._combat_layout or self.layout or self.layout_info) if full else None
+        if full:
+            h,w=frame.shape[:2]
+            self.last_world_gray=cv2.cvtColor(cv2.resize(frame[round(h*.30):round(h*.86),round(w*.08):round(w*.92),:3],(192,96),interpolation=cv2.INTER_AREA),cv2.COLOR_BGR2GRAY)
+        layout=self._combat_layout
+        if context and full and layout and (layout['width'],layout['height'])==tuple(size):
+            now=context['now'];key=(context['epoch'],tuple(layout[k] for k in ('left','right','top','width','height')))
+            top,menu,extract,info=project_layout(frame,layout)
+            scores=self.scores_top(top);menu_score=self.menu_score_top(menu)
+            absent=(not start_hud_evidence(self.last_features) and self.last_features.get('combat_score',0)<=.22 and menu_score<.55 and
+                    all(self.last_features.get(k,0)<v for k,v in (('body_shape',.2),('bar_frames',.15),('label_shape',.2))))
+            cue=self.merge_center_timer(frame,size,self.extraction_features(extract))
+            allowed=context['allowed'] and not cue.get('banner') and cue.get('title_score',0)<.8
+            result=self.relative_watch.candidate(now,frame,allowed=allowed,absent=absent,key=key)
+            hsv_stats=self.hsv_watch.measure(frame)
+            hsv=self.hsv_watch.candidate_stats(now,hsv_stats,allowed=allowed,absent=absent,key=key)
+            if hsv['certified']:
+                result=dict(hsv,legacy=dict(result))
+            else:
+                result['hsv']=hsv
+            dark_stats=self.dark_watch.measure(frame)
+            dark=self.dark_watch.candidate_stats(now,dark_stats,allowed=allowed,absent=absent,key=key)
+            if dark['certified']:result=dict(dark,legacy=dict(result))
+            else:result['dark_trend']=dark
+            self.last_relative_fade=result
+            if result['certified']:
+                # Cheap text/layout veto remains on the current frame. A new
+                # panel never inherits an older frame's negative review.
+                from settlement_fast import FastProbe
+                possible_title=FastProbe.possible_title(frame,layout)
+                if result.get('path')=='dark_trend' and possible_title:
+                    pending_dark=dict(result,review='full_detector_then_worker_title');pending_dark_key=key
+                    result.update(certified=False,reason='dark_trend_requires_full_review')
+                else:
+                    interaction,inventory,_,review_ms=review_ui(
+                        lambda:self.interaction_ui.detect(frame,size,dict(layout)),
+                        lambda:self.inventory_ui.detect(frame,size,dict(layout),return_score=self.last_menu_features.get('inventory_return',0.)))
+                    result['ui_review_ms']=review_ms['wall_ms']
+                    if interaction.get('steam') or interaction.get('btr') or inventory.get('present'):
+                        result.update(certified=False,reason='current_frame_ui_visible')
+                        self.hsv_watch.reset('current_frame_ui_visible')
+                        self.dark_watch.reset('current_frame_ui_visible')
+                    elif possible_title:
+                        result.update(certified=False,reason='new_text_or_panel_ambiguity')
+                        self.hsv_watch.reset('new_text_or_panel_ambiguity')
+                        self.dark_watch.reset('new_text_or_panel_ambiguity')
+                    else:
+                        self.last_parallel=dict(used=False);self.layout_recovery=None
+                        self.layout_info=info;self.menu_layout_info=info
+                        self.last_top=top;self.menu_top=menu;self.extraction_top=extract
+                        self.last_features['layout']=dict(info);self.last_features['relative_death']=dict(result)
+                        self.last_extraction=cue
+                        self.last_inventory=dict(observed=False,complete=False,present=False,popup_count=0)
+                        self.last_interaction=dict(observed=True,steam=False,btr=False)
+                        self.last_menu_features.update(inventory_ui=self.last_inventory,
+                            settings_ui=dict(observed=False,graphics=False,display_changed=False,apply_box=None,countdown=None))
+                        self.last_death_fast=dict(used=result.get('path')!='dark_trend',reason=result['reason'],scene=dict(result))
+                        self.last_esc_fast=dict(used=False,reason='relative_fade_confirmed');self._esc_track=None
+                        return scores,menu_score
+        result=self._analyze_original(frame,full_size)
+        if full and self.last_candidate_world_gray is None:
+            self.last_candidate_world_gray=candidate_world_preview(frame,self._combat_layout or self.layout or self.layout_info)
+        self.last_extraction=self.merge_center_timer(frame,size,self.last_extraction)
+        if context and full and self._combat_layout:
+            layout=self._combat_layout
+            key=(context['epoch'],tuple(layout[k] for k in ('left','right','top','width','height')))
+            features=self.last_features
+            visible=start_hud_evidence(features) and result[1]<.55
+            absent=not start_hud_evidence(features) and features.get('combat_score',0)<=.22 and result[1]<.55
+            cue=self.last_extraction
+            self.relative_watch.reviewed_frame(context['now'],frame,visible=visible,absent=absent,key=key,
+                allowed=context['allowed'] and not cue.get('banner') and cue.get('title_score',0)<.8)
+            # HSV cannot borrow a negative review from inventory/Steam/BTR or
+            # settings pixels, even when legacy top-menu scores are low.
+            interaction=self.last_interaction;inventory=self.last_inventory
+            settings=self.last_menu_features.get('settings_ui',{})
+            hsv_allowed=(context['allowed'] and not cue.get('banner') and cue.get('title_score',0)<.8
+                and not interaction.get('steam') and not interaction.get('btr') and not inventory.get('present')
+                and not settings.get('graphics') and not settings.get('display_changed'))
+            self.hsv_watch.reviewed_stats(context['now'],hsv_stats if hsv_stats is not None else self.hsv_watch.measure(frame),
+                visible=visible,absent=absent,key=key,allowed=hsv_allowed)
+            self.dark_watch.reviewed_stats(context['now'],dark_stats if dark_stats is not None else self.dark_watch.measure(frame),
+                visible=visible,absent=absent,key=key,allowed=hsv_allowed)
+            if (pending_dark and hsv_allowed and result[1]<.55 and
+                key==pending_dark_key and key==self.dark_watch.key and not visible and features.get('combat_score',0)<=.22 and
+                all(features.get(k,0)<v for k,v in (('body_shape',.2),('bar_frames',.15),('label_shape',.2)))):
+                self.last_features['relative_death']=dict(pending_dark)
+                self.last_relative_fade=dict(pending_dark)
+                # last_death_fast stays unchanged: this path must still pass
+                # the worker's current-frame title/transition/ownership checks.
+                return result
+        self.last_features.pop('relative_death',None)
+        return result
+
+    def _analyze_original(self, frame, full_size=None):
+        self.last_parallel=dict(used=False);self.last_same_frame_menu_reused=False
+        full_size=full_size or (frame.shape[1],frame.shape[0])
+        dark=self.known_combat_black_frame(frame,full_size)
+        if dark is not None:return dark
+        quick=self.confirmed_esc_frame(frame,full_size)
+        if quick is not None:return quick
+        fallback=dict(self.last_esc_fast);self._esc_track=None
         top=self.normalize_top(frame,full_size)
+        self.last_esc_fast=fallback
         self.last_top=top  # owned resize output; safe for a bounded diagnostic ring
         self.last_extraction=self.extraction_features(self.extraction_top)
         scores=self.scores_top(top)
         self.last_features['layout']=dict(self.layout_info)
+        self.last_inventory=dict(observed=False,complete=False,present=False,popup_count=0)
+        self.last_interaction=dict(observed=False,steam=False,btr=False)
         # A confident combat HUD already prevents absence. Avoid expensive logo
         # searches in this common case; inspect menus only when HUD is unclear.
         if self.last_features['combat_score']>=.48:
+            if frame.shape[0]>=full_size[1]-2:
+                self.last_interaction=self.interaction_ui.detect(frame,full_size,self.layout_info,steam_only=True)
+                if self.last_interaction.get('steam') or self.last_interaction.get('btr'):
+                    self.last_menu_features=dict(interaction_ui=self.last_interaction,inventory=0.,settings=0.,pause=0.,confirmation=0.)
+                    return scores,1.
+            self._combat_layout={k:self.layout_info[k] for k in ('left','right','top','width','height')}
+            self.observe_settings=False;self.settings_ui.masks=None;self.settings_ui.pending_masks=None
             self.last_menu_features=dict(inventory=0.,settings=0.,pause=0.,confirmation=0.,skipped_for_combat=True)
             return scores,0.
-        return scores,self.menu_score_top(self.menu_top)
+        cached=getattr(self,'_same_frame_menu',None)
+        self.last_same_frame_menu_reused=bool(cached is not None and cached[0]==id(frame) and
+            cached[1].shape==self.menu_top.shape and np.array_equal(cached[1],self.menu_top))
+        if self.last_same_frame_menu_reused:
+            menu=cached[2];self.last_menu_features=dict(cached[3])
+        else:menu=self.menu_score_top(self.menu_top)
+        self._same_frame_menu=None
+        self.menu_layout_info=dict(self.layout_info)
+        # Some menu pages span the full window even when combat is pillarboxed.
+        # Compare menu anchors independently; never rewrite the combat viewport
+        # using menu text as HUD evidence.
+        fw,fh=full_size or (frame.shape[1],frame.shape[0])
+        if self.layout_info.get('left',0)!=0 or self.layout_info.get('right',fw)!=fw or self.layout_info.get('top',0)!=0:
+            _,full_menu,_,full_info=project_layout(frame,dict(left=0,right=fw,top=0,width=fw,height=fh))
+            previous=dict(self.last_menu_features)
+            full_score=self.menu_score_top(full_menu)
+            if full_score>=.55 and full_score>menu+.05:
+                menu=full_score;self.menu_top=full_menu;self.menu_layout_info=full_info
+            else:self.last_menu_features=previous
+        # A centered 16:9 menu canvas may sit over a full-width ultrawide
+        # world. Background outside it need not be black. This is menu-only.
+        if fw/fh>1.85 and menu<.80:
+            margin=max(0,round((fw-fh*16/9)/2))
+            _,center_menu,_,center_info=project_layout(frame,dict(left=margin,right=fw-margin,top=0,width=fw,height=fh))
+            previous=dict(self.last_menu_features)
+            center_score=self.menu_score_top(center_menu)
+            if center_score>=.55 and center_score>menu+.05:
+                menu=center_score;self.menu_top=center_menu;self.menu_layout_info=center_info
+            else:self.last_menu_features=previous
+        needs_settings=(self.observe_settings or self.last_menu_features.get('settings',0)>=.55 or self.last_menu_features.get('pause',0)>=.55)
+        saved_settings=(self.settings_ui.masks,self.settings_ui.pending_masks)
+        return_score=self.last_menu_features.get('inventory_return',0.)
+        if self.parallel_ui and frame.shape[0]>=full_size[1]-2:
+            interaction,inventory,settings,self.last_parallel=review_ui(
+                lambda:self.interaction_ui.detect(frame,full_size,dict(self.layout_info)),
+                lambda:self.inventory_ui.detect(frame,full_size,dict(self.layout_info),return_score=return_score),
+                (lambda:self.settings_ui.detect(frame,full_size)) if needs_settings else None)
+            if interaction.get('steam') or interaction.get('btr') or inventory.get('present'):
+                self.settings_ui.masks,self.settings_ui.pending_masks=saved_settings
+        else:
+            interaction=self.interaction_ui.detect(frame,full_size,self.layout_info)
+            inventory=None;settings=None
+            if not (interaction.get('steam') or interaction.get('btr')):
+                inventory=self.inventory_ui.detect(frame,full_size,self.layout_info,return_score=return_score)
+                if needs_settings and not inventory['present']:settings=self.settings_ui.detect(frame,full_size)
+        self.last_interaction=interaction
+        if interaction.get('steam') or interaction.get('btr'):
+            self.last_menu_features=dict(interaction_ui=interaction,inventory=0.,settings=0.,pause=0.,confirmation=0.)
+            return scores,1.
+        self.last_inventory=inventory
+        self.last_menu_features['inventory_ui']=self.last_inventory
+        if self.last_inventory['present']:menu=max(menu,.95)
+        if self.last_menu_features.get('settings',0)>=.55 or self.last_menu_features.get('pause',0)>=.55:self.observe_settings=True
+        if needs_settings and not inventory['present']:
+            self.last_menu_features['settings_ui']=settings
+            if settings.get('graphics'):menu=max(menu,.95)
+        self.remember_esc(frame,full_size)
+        if menu<.55 and start_hud_evidence(self.last_features):
+            self._combat_layout={k:self.layout_info[k] for k in ('left','right','top','width','height')}
+        return scores,menu
+
+    def merge_center_timer(self,frame,full_size,cue):
+        cue=dict(cue);now=self.relative_context['now'] if self.relative_context else time.perf_counter()
+        if cue.get('banner') or cue.get('title_score',0)>=.8:self.extraction_full_until=max(self.extraction_full_until,now+4.)
+        layout=self.layout or self._combat_layout or self.layout_info
+        key=(now,frame.ctypes.data,frame.shape,tuple(layout.get(k) for k in ('left','right','top','width','height')) if layout else None)
+        full=frame.shape[:2]==(full_size[1],full_size[0])
+        if key==self.center_frame_key:
+            center=dict(self.center_frame_result)
+        elif full and (now<self.extraction_full_until or self.center_scan_time is None or now-self.center_scan_time>=1. or (self.center_frame_key is not None and key[-1]!=self.center_frame_key[-1])):
+            center=self.center_timer.detect(frame,full_size,layout,observed_at=now);self.center_scan_time=now
+            self.center_frame_key=key;self.center_frame_result=dict(center)
+        else:center=dict(observed=False,present=False,reason='needs_full_frame' if not full else 'scan_not_due')
+        cue['top_banner']=cue.get('banner',False);cue['top_timer_state']=cue.get('timer_state');cue['top_timer_digits']=list(cue.get('timer_digits',[]));cue['center_timer']=center
+        if center.get('present'):
+            self.extraction_full_until=max(self.extraction_full_until,now+4.)
+            self.center_preferred_until=max(self.center_preferred_until,now+4.)
+            cue['banner']=True;cue['timer_source']='center'
+            value=center.get('value');cue['center_value']=value
+            cue['timer_state']='unknown' if value is None else 'zero' if value==0 else 'nonzero'
+            cue['timer_digits']=[];cue['timer_text']=None if value is None else f'{value:.1f}'
+            cue['zero_score']=center.get('confidence',0.) if value==0 else 0.
+        elif now<self.extraction_full_until:
+            # Never overwrite a fresh decimal center reading with the top
+            # counter's stale integer value while the widgets disappear.
+            cue.update(timer_source='center_unreadable',center_value=None,timer_state='unknown',timer_digits=[],zero_score=0.)
+        else:cue['timer_source']='top'
+        cue['full_observation_requested']=now<self.extraction_full_until
+        return cue
 
     def extraction_features(self,top):
         scene_luma=float(cv2.cvtColor(top[100:230,200:1600],cv2.COLOR_BGR2GRAY).mean())
@@ -161,6 +506,10 @@ class Detector:
         return self.scores_top(self.normalize_top(frame))
 
     def scores_top(self, top):
+        cached=getattr(self,'_last_scores_top',None)
+        if cached is not None and cached[0].shape==top.shape and np.array_equal(cached[0],top):
+            self.last_features=dict(cached[1])
+            return cached[2]
         health,_ = features(top)
         color=float(np.mean(cv2.dilate(health,np.ones((3,3),np.uint8))[self.masks[0]>0]>0))
         gray=cv2.cvtColor(cv2.resize(top[15:235,20:115],(48,110)),cv2.COLOR_BGR2GRAY)
@@ -176,7 +525,9 @@ class Detector:
         labels=self.distance_support(cv2.Canny(cv2.cvtColor(cv2.resize(top[8:32,575:1195],(310,12)),cv2.COLOR_BGR2GRAY),35,90),self.labels)
         total=.20*body+.45*frames+.30*labels+.05*color
         self.last_features=dict(body_shape=body,bar_frames=frames,label_shape=labels,color=color,combat_score=total)
-        return body,.58*frames+.42*labels
+        out=(body,.58*frames+.42*labels)
+        self._last_scores_top=(top.copy(),dict(self.last_features),out)
+        return out
 
     @staticmethod
     def distance_support(edges,reference):
@@ -231,10 +582,20 @@ class ExtractionGuard:
         # A sequence of confident decrements can establish timing when the final
         # glyph fades before 00. Unknown glyphs never become zero evidence.
         digits=cue.get('timer_digits',[])
-        if cue.get('timer_state') not in ('nonzero','zero') or len(digits)!=2:return False
-        value=10*digits[0]+digits[1]
-        if not 0<=value<=30:return False
+        if cue.get('timer_source')=='center':
+            value=cue.get('center_value')
+            if value is None or cue.get('timer_state') not in ('nonzero','zero'):return False
+            value=float(value)
+        else:
+            if cue.get('timer_state') not in ('nonzero','zero') or len(digits)!=2:return False
+            value=10*digits[0]+digits[1]
+        maximum=CenterExtractionTimer.MAX_SECONDS if cue.get('timer_source')=='center' else 30
+        if not 0<=value<=maximum:return False
+        if self.count_last is not None and now-self.count_last>.75:
+            self.reset('countdown_observation_gap')
         decreased=self.count_value is not None and value<self.count_value
+        if decreased and abs((self.count_value-value)-(now-self.count_since))>1.5:
+            self.reset('countdown_inconsistent_jump');decreased=False
         if self.count_value is None:
             self.count_value=value;self.count_since=now;self.count_start=now;self.count_steps=0
         elif value!=self.count_value:
@@ -245,51 +606,31 @@ class ExtractionGuard:
         self.count_luma=luma;self.count_last=now
         return decreased
 
+    def near_end(self, now):
+        # Never extrapolate an old mid-countdown reading all the way to zero.
+        return (self.count_value is not None and self.count_last is not None and
+                0 <= now-self.count_last <= 1.0 and self.count_value <= 1 and
+                (self.count_steps >= 1 or self.zero_confirmed))
+
     def update(self,now,combat_score,menu_present,cue):
-        if not cue:
-            self.reset('no_cue');return False
-        if menu_present:
-            self.reset('menu_visible');return False
-        luma=cue['scene_luma']
-        if cue['banner']:
-            self.track_countdown(now,cue,luma)
-            self.fade_start=None;self.falling=0
-            state=cue.get('timer_state','zero' if cue['zero_score']>=.80 else 'nonzero')
-            if state=='zero' and cue['zero_score']<.80:state='unknown'
-            if state=='zero' and cue['zero_score']>=.80:
+        """Observe only. Timing/luma alone never authorize extraction."""
+        cue=cue or {}
+        if cue.get('banner'):
+            self.track_countdown(now,cue,cue.get('scene_luma',0.))
+            if cue.get('timer_state')=='zero' and cue.get('zero_score',0)>=.8:
                 if self.zero_start is None:self.zero_start=now
-                self.zero_last=now;self.zero_luma=luma
+                self.zero_last=now
                 if now-self.zero_start>=.15:self.zero_confirmed=True
-                self.reason='zero_tracking'
-            elif state=='unknown' and self.zero_confirmed and now-self.zero_last<=1.0:
-                self.reason='zero_confirmed_digits_faded'
             else:
-                self.zero_start=None;self.zero_last=None;self.zero_confirmed=False;self.reason='timer_unknown' if state=='unknown' else 'timer_nonzero'
-            return False
-        if self.fade_start is None:
-            reason=None
-            countdown_ok=self.count_value is not None and self.count_steps>=1
-            if self.zero_last is None and countdown_ok:
-                self.zero_last=now;self.zero_confirmed=True;self.zero_luma=self.count_luma
-            if self.zero_last is None:reason='zero_not_observed'
-            elif now-self.zero_last>1.0:reason='zero_evidence_expired'
-            elif not self.zero_confirmed:reason='zero_seen_too_briefly'
-            elif combat_score<.48:reason='hud_not_confident_at_banner_end'
-            if reason:
-                self.reset(reason);return False
-            self.fade_start=now;self.previous_luma=luma
-        if now-self.fade_start>3.0 or combat_score<=.22:
-            self.reset('fade_timeout' if now-self.fade_start>3.0 else 'hud_lost_before_fade_confirmation');return False
-        if luma<=self.previous_luma+.02*max(self.zero_luma,1):self.falling+=1
-        else:self.falling=0
-        self.previous_luma=luma
-        self.reason='waiting_fade'
-        # Confirm while the combat HUD still exists. Sudden HUD loss before
-        # fade confirmation remains a death candidate handled by Gate.
-        if now-self.fade_start>=.20 and self.falling>=3 and combat_score>=.48 and luma<=self.zero_luma*.65:
-            record=dict(fade_seconds=now-self.fade_start,baseline_luma=self.zero_luma,current_luma=luma,combat_score=combat_score)
-            self.reset('confirmed');self.last_confirmation=record;return True
+                self.zero_start=None;self.zero_last=None;self.zero_confirmed=False
+            self.reason='near_end' if self.near_end(now) else 'countdown_tracking'
+        elif self.count_last is not None:
+            # A visible battle frame without the banner proves departure, except
+            # the short final fade whose last reliable reading was already <=1.
+            if (not menu_present and combat_score>.22 and not self.near_end(now)) or now-self.count_last>1.:
+                self.reset('countdown_left_or_expired')
         return False
+
 
 
 class Gate:
@@ -300,7 +641,7 @@ class Gate:
         self.delay_ms=delay_ms
         self.missing_since=None
         self.last_interface='combat'
-        self.last_observation=None
+        self.last_observation=None;self.absence_observed=0.
         self.max_observation_gap=.2
 
     def arm(self, scores, menu_present=False, combat_score=None,features=None):
@@ -309,32 +650,37 @@ class Gate:
         self.missing = 0
         self.missing_since=None
         self.last_interface='menu' if menu_present else 'combat'
-        self.last_observation=None
+        self.last_observation=None;self.absence_observed=0.
         return self.active
 
     def cancel(self):
         self.active = False
         self.missing = 0
         self.missing_since=None
-        self.last_observation=None
+        self.last_observation=None;self.absence_observed=0.
 
     def update(self, scores, menu_present=False, now=None, combat_score=None,features=None):
         if not self.active:
             return False
         now=time.perf_counter() if now is None else now
         if combat_score is not None:
+            delta=0. if self.last_observation is None else max(0.,now-self.last_observation)
             self.last_observation=now
             # The delay must contain continuously confirmed absence, not just
             # lack of a high-confidence recovery. Uncertainty resets the clock.
             self.last_visibility={key:features.get(key,0) for key in ('combat_score','body_shape','bar_frames','label_shape')} if features is not None else None
             hud_visible=start_hud_evidence(features) if features is not None else False
             if menu_present or hud_visible or combat_score>.22:
-                self.missing=0;self.missing_since=None
+                self.missing=0;self.missing_since=None;self.absence_observed=0.
                 return False
             if combat_score<=.22:
-                if self.missing_since is None:self.missing_since=now
+                if self.missing_since is None:self.missing_since=now;self.absence_observed=0.
+                if self.missing>0:
+                    # Keep prior confirmed evidence on a slow machine, but do not
+                    # turn a long observation gap into confirmed absence time.
+                    self.absence_observed+=min(delta,max(.12,self.max_observation_gap))
                 self.missing+=1
-                if self.missing>=2 and (now-self.missing_since)*1000>=self.delay_ms:
+                if self.missing>=2 and self.absence_observed*1000>=self.delay_ms:
                     self.cancel();return True
             return False
         if menu_present:self.last_interface='menu'

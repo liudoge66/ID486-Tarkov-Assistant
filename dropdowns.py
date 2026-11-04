@@ -88,7 +88,7 @@ class Dropdowns:
         if not kind:return
         # The overlay owns pointer/focus targets within its visible rectangle.
         audio=kind=='audio';numeric=kind in ('delay','hz')
-        x0,y0,x1={'audio':(250,570,665),'key':(940,570,1253),'delay':(825,1135,920),'hz':(1178,1135,1255)}[kind];rowh=54
+        x0,y0,x1={'audio':(250,570,665),'key':(940,570,1253),'delay':(855,1009,948),'hz':(1180,1009,1255)}[kind];rowh=54
         if numeric:
             values=(150,300,500) if kind=='delay' else (15,30,60)
             current=self.app.delay_text.get() if kind=='delay' else self.app.hz_text.get()
@@ -142,4 +142,3 @@ class Dropdowns:
         md.rectangle((0,0,width-1,total-radius-1),fill=255)
         layer=layer.convert('RGBA');layer.putalpha(mask)
         self.paste(im,layer.crop((0,0,x1-x0,height)),x0,y0)
-
