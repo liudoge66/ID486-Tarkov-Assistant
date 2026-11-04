@@ -15,8 +15,6 @@
 
 **[下载 V0.3](https://github.com/liudoge66/ID486-Tarkov-Assistant/releases/tag/v0.3)** · [快速使用](#快速使用) · [场景处理](#不同场景如何处理) · [技术方案](#当前技术方案) · [更新记录](docs/CHANGELOG.md)
 
-<img src="docs/images/interface-dark.png" width="360" alt="V0.3 深色界面">
-
 </div>
 
 ---
@@ -33,6 +31,10 @@ V0.3 统一为一个版本，保留深浅主题、音效、快捷键、诊断和
 - 大退与网络隔离不能承诺服务器回滚；已经送达的结算无法保证撤回。
 - 演练模式不结束游戏进程；**如果同时开启联网保险，死亡判定仍可能隔离网络**。需要纯识别测试时，请保持联网保险关闭。
 - 使用中文界面及已验证的 HUD 布局；不同语言、UI 缩放、分辨率和未知叠加层需要自行确认。4K HDR 已有本机实测，21:9 等布局的适配不代表所有显示组合均已验证。
+
+<p align="center">
+  <img src="docs/images/interface-dark.png" width="360" alt="V0.3 深色界面">
+</p>
 
 ### UU 加速器设置
 
