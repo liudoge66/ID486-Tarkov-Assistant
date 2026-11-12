@@ -1,0 +1,13 @@
+{
+  "map": "Lighthouse",
+  "center": [444.9676, 33.391, 457.5872],
+  "enter_radius": 32.0,
+  "exit_radius": 45.0,
+  "height_min": 18.0,
+  "height_max": 60.0,
+  "cadence": {"max_speed": 6.0, "latency": 1.5, "min_interval": 3.0, "max_interval": 60.0, "initial_interval": 30.0},
+  "cadence_note": "Next screenshot = distance to the nearest protection boundary / max_speed - latency, clamped to [min_interval, max_interval]. 2026-11-09 field track: sprint peaked at 5.1 m/s, request-to-file about 1.2 s.",
+  "source": "NepPure/tarkov-offline-map data/maps-dump.json: Lighthouse Lightkeeper Switch positions",
+  "source_positions": [[445.3035, 33.391, 457.5599], [444.6317, 33.391, 457.6145]],
+  "validation": "Door-switch anchors verified against upstream data; protection radius/height await controlled in-game calibration."
+}

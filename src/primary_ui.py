@@ -35,6 +35,7 @@ class PrimaryUI(VolumeControl,Dropdowns):
         for rect in ((140,578,702,610),(975,356,1288,434)):
             if rect[1]==578 or not FENCE:self.fill(d,rect,self.card)
         self.fill(d,(970,394,1290,438),self.card)
+        self.fill(d,(780,340,1290,394),self.card)  # old network label + switch; redrawn live below
         self.fill(d,(534,1770,854,1815),self.pixel(self.reference,700,1750))
         self.light=self.lighten(self.dark)
         self.canvas=tk.Canvas(app.root,highlightthickness=0,bd=0,bg='#111115',takefocus=True);self.canvas.pack(fill='both',expand=True)
@@ -44,7 +45,7 @@ class PrimaryUI(VolumeControl,Dropdowns):
         self.previous_source=None;self.display_pil=None;self.previous_moving=False;self.previous_theme=None;self.border_cache={}
         for event,fn in [('<Configure>',lambda e:self.schedule()),('<Button-1>',self.mouse_down),('<ButtonRelease-1>',self.mouse_up),('<Motion>',self.motion),('<Leave>',self.leave),('<Tab>',self.tab),('<Shift-Tab>',lambda e:self.tab(e,-1)),('<Return>',self.activate),('<space>',self.activate),('<FocusOut>',self.focus_out)]:self.canvas.bind(event,fn)
         for key in ('<Left>','<Right>','<Home>','<End>'):self.canvas.bind(key,self.volume_key)
-        for v in (app.status,app.bottom_status,app.state_head,app.key_label,app.dry,app.return_sound,app.mute_var,app.sound_on_var,app.sound_off_var,app.delay_text,app.hz_text,app.collect_var,app.log_var,app.network_var,app.network_status):v.trace_add('write',lambda *args:self.schedule())
+        for v in (app.status,app.bottom_status,app.state_head,app.key_label,app.dry,app.return_sound,app.mute_var,app.sound_on_var,app.sound_off_var,app.delay_text,app.hz_text,app.collect_var,app.log_var,app.network_var,app.zone_var,app.network_status,app.screenshot_hint):v.trace_add('write',lambda *args:self.schedule())
         for k,v in (('prep',app.prep_feedback),('advanced',app.advanced_feedback)):v.trace_add('write',lambda *args,k=k,v=v:self.notice_changed(k,v))
         s=min(.72,(app.root.winfo_screenwidth()-100)/1320,(app.root.winfo_screenheight()-130)/1758)
         app.root.geometry(f'{round(1320*s)}x{round(1758*s)}');app.root.minsize(round(1320*min(s,.42)),round(1758*min(s,.42)));app.root.resizable(True,True);self.schedule()
@@ -137,7 +138,8 @@ class PrimaryUI(VolumeControl,Dropdowns):
             for key in ('theme_dark','theme_light'):
                 r=self.meta[key]['bbox'];self.paste(im,self.colored(self.tile(key),fg),r[0],r[1])
         self.fill(d,(143,462,253,494),card)
-        self.paste(im,self.text_tile('大退音效',24,fg),143,465)
+        audio_heading=self.text_tile('大退音效',24,fg)
+        self.paste(im,audio_heading,143,494-audio_heading.height)
         self.paste(im,self.text_tile(getattr(self.app,'version_label',''),14,mix((85,85,93),(119,113,125),theme),en=True),698,201)
         self.draw_segment(im,'preview',(143,509,253,572),self.preview,theme);self.draw_segment(im,'check',(730,508,943,572),self.check_hotkey,theme)
         for name,r,default,value in [('audio_value',(250,508,665,572),'原版死亡回归',self.app.sounds.selected['exit'] or '无音效'),('hotkey_value',(940,508,1253,572),'F10',self.app.key_name),('delay_value',(856,952,948,1012),'300',self.app.delay_text.get()),('hz_value',(1180,952,1255,1012),'30',self.app.hz_text.get())]:
@@ -159,7 +161,7 @@ class PrimaryUI(VolumeControl,Dropdowns):
             self.control(key,r,lambda k=kind:self.toggle_dropdown(k))
         self.draw_save(im,'save_prep',(1058,651,1285,708),self.app.save_preparation,theme);self.draw_save(im,'save_advanced',(1059,1344,1285,1401),self.app.save_advanced,theme)
         mute=self.tween('disabled_audio',float(self.app.mute_var.get()))
-        for key,var in [('sound_on',self.app.sound_on_var),('sound_off',self.app.sound_off_var),('sound_exit',self.app.return_sound),('mute',self.app.mute_var),('network',self.app.network_var),('screenshots',self.app.collect_var),('logs',self.app.log_var),('dry',self.app.dry)]:
+        for key,var in [('sound_on',self.app.sound_on_var),('sound_off',self.app.sound_off_var),('sound_exit',self.app.return_sound),('mute',self.app.mute_var),('network',self.app.network_var),('zone',self.app.zone_var),('screenshots',self.app.collect_var),('logs',self.app.log_var),('dry',self.app.dry)]:
             if key=='network' and not NETWORK:continue
             disabled=mute if key in ('sound_on','sound_off','sound_exit') else 0.;enabled=not (key in ('sound_on','sound_off','sound_exit') and self.app.mute_var.get())
             self.draw_switch(im,key,var,theme,disabled,enabled)
@@ -172,16 +174,18 @@ class PrimaryUI(VolumeControl,Dropdowns):
             self.fill(d,(140,1072,520,1145),card)
             self.paste(im,self.text_tile('保存全屏截图/收集日志',24,fg),144,1079)
             self.paste(im,self.text_tile('Save Full Screenshot / Collect Logs',18,muted,en=True),146,1119)
-        if NETWORK:
-            # Preserve the PSD font/size; field and switch share one binary action.
-            r=self.meta['network_label']['bbox'];self.paste(im,self.colored(self.tile('network_label'),fg),r[0],r[1])
-            self.control('network_settings',(975,352,1220,392),self.app.toggle_network)
+        # Two labelled switches (PSD: 24 px label ending 9 px left of its switch, centred on the switch).
+        for key,text,action in (('network','联网自动断开',self.app.toggle_network),('zone','监控自动暂停',self.app.toggle_zone)):
+            if key=='network' and not NETWORK:continue
+            sw=self.meta['switch_'+key]['rect'];tile=self.text_tile(text,24,fg)
+            x=sw[0]-9-tile.width;y=round((sw[1]+sw[3]-tile.height)/2)
+            self.paste(im,tile,x,y);self.control(key+'_label',(x-6,sw[1]-2,sw[0],sw[3]+2),action)
         self.draw_notices(im,card,muted);self.draw_status(im,card,fg,muted)
         if NETWORK and (self.app.network_var.get() or self.app.network_status.get()!='联网控制未开启'):
             self.fill(d,(740,398,1288,438),card)
             tile=self.network_status_tile(self.app.network_status.get(),muted)
             self.paste(im,tile,1284-tile.width,410)
-        for key,r,title,fn in [('open_log',(140,1770,290,1815),'打开日志',self.app.open_log),('stop',(1100,1770,1300,1815),'停止监控',self.app.stop_all)]:
+        for key,r,title,fn in [('open_log',(140,1770,290,1815),'打开日志',self.app.open_log),('project',(605,1770,805,1815),'项目地址',self.app.open_project),('stop',(1100,1770,1300,1815),'停止监控',self.app.stop_all)]:
             self.fill(d,r,self.pixel(self.reference,700,1750))
             self.control(key,r,fn);h=self.tween('hover:'+key,float(self.hover_key==key),.12);self.centered(im,self.text_tile(title,21,mix(muted,fg,h)),r)
         self.draw_volume(im,muted)
@@ -217,7 +221,7 @@ class PrimaryUI(VolumeControl,Dropdowns):
             regions=[c.rect for c in self.controls.values()]
             regions += [(250,508,700,900),(940,508,1287,845),(825,952,952,1179),(1178,952,1287,1179)]
             regions += [(140,575,705,612)]
-            regions += [(975,352,1288,394),(740,398,1290,438)]
+            regions += [(1000,340,1290,394),(740,398,1290,438),(1000,818,1290,882)]
             regions += [(138,664,1036,705),(138,1358,1036,1403),(96,1479,1331,1739)]
             regions += [self.meta[k]['bbox'] for k in ('on_label','off_label','exit_label')]
             changed=False;settling=self.previous_moving and not self.moving
@@ -267,6 +271,7 @@ class PrimaryUI(VolumeControl,Dropdowns):
         meta=self.meta['switch_'+key];r=tuple(meta['rect']);region=meta['region']
         def change():
             if key=='network':self.app.toggle_network();return
+            if key=='zone':self.app.toggle_zone();return
             var.set(not var.get())
             if key!='dry':self.app.advanced_feedback.set('尚未保存')
         self.control(key,(r[0]-5,r[1]-7,r[2]+5,r[3]+7),change,enabled);value=self.tween('switch:'+key,float(var.get() and not (key in ('sound_on','sound_off','sound_exit') and self.app.mute_var.get())),.18)
@@ -293,8 +298,14 @@ class PrimaryUI(VolumeControl,Dropdowns):
     def draw_status(self,im,card,fg,muted):
         state,color=self.current_state(self.palette());d=ImageDraw.Draw(im)
         if state!='未启动':self.draw_status_border(im,color)
+        view=getattr(self.app,'zone_view',None) if self.app.active else None
+        if view is not None:
+            r=self.meta['avatar']['bbox'];self.fill(d,r,card);self.paste(im,self.tile('avatar_'+view['avatar']),r[0],r[1])
         if state!='未启动':self.fill(d,(140,1521,1047,1602),card);self.paste(im,self.text_tile('当前状态：'+state,60,color,maxwidth=900),145,1530)
-        if self.app.key_name!='F10' or not self.app.hotkeys or state!='未启动':
+        hint=self.app.screenshot_hint.get() if state=='未启动' else ''
+        if hint:
+            self.fill(d,(140,1607,1044,1648),card);self.paste(im,self.text_tile(hint,24,self.palette()['accent'],maxwidth=900),145,1616)
+        elif self.app.key_name!='F10' or not self.app.hotkeys or state!='未启动':
             self.fill(d,(140,1607,1044,1648),card);caption=self.app.status.get() if state!='未启动' or not self.app.hotkeys else f'进入战局后，请在左上角人物血量HUD可见后按{self.app.key_name}';self.paste(im,self.text_tile(caption,24,color,maxwidth=900),145,1616)
         self.fill(d,(332,1661,1045,1702),card)
         caption='仅记录死亡候选，不执行大退' if self.app.dry.get() else '确认执行  判定死亡后直接结束游戏进程'
@@ -314,8 +325,11 @@ class PrimaryUI(VolumeControl,Dropdowns):
     def current_state(self,p):
         status=self.app.bottom_status.get()
         if self.app.active and status.startswith('转移中'):return ('转移等待中','#BB9B5D')
+        view=getattr(self.app,'zone_view',None)
+        if self.app.active and view is not None:return (view['label'],view['color'])
         if self.app.active:return ('已暂停' if '暂停' in status else '监控中','#6DAE8A')
         if self.app.arming:return ('正在连接','#BB9B5D')
+        if status=='无法启动 · 线上战局':return (status,'#BB9B5D')
         if status.startswith('录像测试中'):return ('录像测试中','#BB9B5D')
         if status.startswith('录像已退出'):return ('录像已退出','#6DAE8A')
         if status.startswith('录像已结束'):return ('录像已结束','#6DAE8A')

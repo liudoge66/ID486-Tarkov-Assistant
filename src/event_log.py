@@ -3,6 +3,15 @@ from datetime import datetime
 import json, threading, time, uuid
 
 NAMES = {
+    'lighthouse_map':'本轮地图已核对',
+    'lighthouse_key_check':'游戏截图键检测',
+    'lighthouse_zone_cue':'商人区域进出提示音',
+    'lighthouse_position_started':'灯塔坐标辅助监测已启动',
+    'lighthouse_screenshot_requested':'灯塔坐标截图已请求',
+    'lighthouse_coordinate':'灯塔游戏坐标已更新',
+    'lighthouse_position_state':'灯塔商人区域保护状态',
+    'lighthouse_screenshot_missing':'游戏坐标截图未生成',
+    'lighthouse_position_error':'灯塔定位暂不可用',
     'network_candidate_end_hold_ack':'已确认结束请求保持，尚未判定最终死亡',
     'network_candidate_end_revoke_requested':'正常画面已反证结束请求保持，等待解除确认',
     'network_candidate_end_revoke_ack':'已确认解除结束请求保持，恢复联网待命',
@@ -25,6 +34,10 @@ NAMES = {
     'relative_death_confirmed':'HUD消失与相对渐黑共同确认死亡',
     'extraction_candidate_started':'撤离渐黑待确认（继续监控）',
     'extraction_candidate_cancelled':'撤离候选已撤销（继续监控）',
+    'extraction_latch_unresolved':'撤离过程未能确认（已停止监控，未退出）',
+    'zone_entered':'已进入撤离/转移区域，自动暂停', 'zone_left':'已离开撤离/转移区域，恢复监控',
+    'zone_done':'撤离/转移完成，进入低频等待', 'zone_standby_started':'低频等待已开始',
+    'zone_standby_resumed':'已识别新一局战斗HUD，恢复正常监控', 'zone_auto_pause_changed':'监控自动暂停开关已更改',
     'full_review_frame_retained':'已有完整画面，继续本帧复核而不整轮重采',
     'game_end_request_summary':'本轮游戏结束请求观察汇总',
     'network_prepare_candidate':'可疑画面已请求网络资源预备（未断网）',
@@ -120,7 +133,7 @@ PMC_EVENTS = {'death_exit_timing','startup','armed','disarmed','arm_rejected','d
 PMC_EVENTS.update(kind for kind in NAMES if kind.startswith(('settlement_','network_candidate_','transfer_')))
 PMC_EVENTS.update(kind for kind in NAMES if kind.startswith('esc_'))
 PMC_EVENTS.update(('steam_overlay_paused','steam_overlay_resumed','steam_overlay_waiting','btr_dialogue_state'))
-PMC_EVENTS.update(('relative_reference_status','relative_death_confirmed','extraction_candidate_started','extraction_candidate_cancelled','capture_backend_ready','capture_color_changed','frame_review_veto','hud_continuity_audit','full_review_frame_retained','game_end_request_summary','network_prepare_candidate','network_prepare_requested','network_prepare_ack','network_prepare_error'))
+PMC_EVENTS.update(('relative_reference_status','relative_death_confirmed','extraction_candidate_started','extraction_candidate_cancelled','extraction_latch_unresolved','capture_backend_ready','capture_color_changed','frame_review_veto','hud_continuity_audit','full_review_frame_retained','game_end_request_summary','network_prepare_candidate','network_prepare_requested','network_prepare_ack','network_prepare_error'))
 
 def stamp(ns=None):
     return datetime.fromtimestamp((ns if ns is not None else time.time_ns())/1e9).astimezone().isoformat(timespec='milliseconds')
@@ -142,6 +155,7 @@ class EventJournal:
         return json.dumps(record,ensure_ascii=False,default=str)+'\n'
 
     def write(self, kind, details, detailed=False):
+        if kind.startswith(('lighthouse_','zone_')):PMC_EVENTS.add(kind)
         if kind.startswith('transfer_'):PMC_EVENTS.add(kind)
         if not self.fence and kind not in PMC_EVENTS and not (detailed and kind in ('performance','focus_paused','focus_resumed','capture_stalled','game_window_hidden','game_window_gone')):return
         if not detailed and kind in ('performance','absence_reset'):return
@@ -155,6 +169,8 @@ class EventJournal:
                 self.stream.write(self._format_jsonl(kind,name,details,wall,mono))
             else:
                 important=[]
+                if kind.startswith('lighthouse_'):
+                    important.append('定位记录：'+json.dumps(details,ensure_ascii=False,default=str))
                 if kind.startswith('transfer_') or kind=='extraction_candidate_cancelled':
                     important.append('判定细节：'+json.dumps(details,ensure_ascii=False,default=str))
                 if kind.startswith('network_candidate_') or kind in ('settlement_end_retry','settlement_end_response','death_exit_timing'):

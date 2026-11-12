@@ -9,6 +9,33 @@ from ui_fade import UniformFadeWatch
 from interaction_ui import SteamOverlayState,confirmed_game_ui
 from probe_context import finite
 
+# ---- Shared timing policy (seconds) -----------------------------------------
+# One name per concept, so every death lane reads the same number.
+FRESH_FRAME=.75          # a frame older than this proves nothing about "now"
+COUNTDOWN_CONTEXT=3.     # an observed extraction/menu countdown blocks the shortcut death lanes this long
+# Extraction latch: once a countdown reached its end and the screen faded with
+# HUD/scene structure kept, the following blackout is extraction, not death.
+# It resolves on fresh evidence, never on a wall-clock expiry that hands the
+# same blackout to the ordinary death lane (the 2026-11-04 22:44 false exit).
+LATCH_FRAME_BUDGET=8     # give up only after this many fresh frames ...
+LATCH_MIN_SECONDS=2.     # ... AND this long (2x the old 1 s expiry), so neither a fast
+                         # replay nor one slow capture can exhaust the latch
+LATCH_WALL_CAP=6.        # safety cap while frames stall; ends as "uncertain", never death
+# Optional "extraction auto-pause" (off by default). While a live extraction
+# countdown or long transit countdown is on screen, NO death lane runs. The
+# player accepts that dying inside the zone is not handled.
+ZONE_FRESH=.75           # a countdown reading this recent means "in the zone"
+ZONE_STALE=1.            # no countdown this long ...
+ZONE_LEAVE_HUD=1.        # ... plus full combat HUD this long = player walked out
+ZONE_RETURN_HUD=3.       # same, after focus was lost inside the zone (countdown may have been missed)
+ZONE_DONE_FRAMES=2       # HUD gone (not a menu) on this many fresh frames ...
+ZONE_DONE_SECONDS=.10    # ... spanning this long = extracted/transferred -> low-frequency standby
+ZONE_LIMBO=10.           # stale countdown, neither clean HUD nor clean absence: give up to standby
+# Low-frequency standby after a zone ends: sample every few seconds, resume on a full HUD seen twice.
+ZONE_STANDBY_INTERVAL=5. # seconds between standby samples
+ZONE_STANDBY_CONFIRM_GAP=.3   # second confirming sample follows the first this fast
+ZONE_STANDBY_CONFIRM_MAX=1.   # ... and the pair must fit in this window
+
 
 def settlement_context_eligible(now,features,menu_score,cue,hint,context):
     """Same conservative policy for main-thread and independent fresh probes."""
@@ -59,46 +86,138 @@ class DecisionEngine:
         self.log_last_combat=None;self.log_last_menu=None
         self.log_token=None;self.log_frames=0;self.log_frame_time=None
         self.log_protection_until=-100.
+        self.position_guard=False
+        self.zone_enabled=False   # user switch "监控自动暂停"
+        self.zone=None            # dict while auto-paused in an extraction/transit zone
+
+    @property
+    def zone_kind(self):
+        return None if self.zone is None else self.zone['kind']
+
+    def zone_signal(self,now):
+        """'extraction' / 'transfer' while a live countdown is observed, else None."""
+        e=self.extraction
+        if (e.count_value is not None and e.count_last is not None and 0<=now-e.count_last<=ZONE_FRESH
+                and (e.count_steps>=1 or self.zone is not None)):
+            return 'extraction'
+        t=self.transfer
+        if (t.kind=='countdown' and t.last_badge is not None and 0<=now-t.last_badge<=ZONE_FRESH
+                and (t.decreases>=1 or self.zone is not None)):
+            return 'transfer'
+        return None
+
+    def zone_step(self,now,result,events,combat,visible,absent,menu_score,extraction_cue,suppress_fade,features):
+        """Returns a finished result while auto-paused, or None to run the normal policy."""
+        self.extraction.update(now,combat,menu_score>=.55,extraction_cue)
+        if not self.zone_enabled:
+            self.zone=None;return None
+        kind=self.zone_signal(now)
+        if kind:
+            if self.zone is None:
+                self.zone=dict(kind=kind,since=now,seen=now,hud_since=None,absent_since=None,absent_frames=0,
+                               limbo=0.,last=now,returned=False)
+                self.clear_absence();self.hud_fade.reset();self.esc_fade.reset();self.fade_pending=None
+                events.append(dict(event='zone_entered',zone=kind))
+            else:
+                self.zone['seen']=now;self.zone['kind']=kind
+        if self.zone is None:return None
+        z=self.zone;stale=now-z['seen'];elapsed=max(0.,now-z['last']);z['last']=now
+        self.clear_absence();self.fade_pending=None
+        # Walked out: countdown gone and complete combat HUD held.
+        complete=menu_score<.55 and resume_hud(features)
+        if complete and stale>=ZONE_STALE:
+            if z['hud_since'] is None:z['hud_since']=now
+        else:z['hud_since']=None
+        need=ZONE_RETURN_HUD if z['returned'] else ZONE_LEAVE_HUD
+        if z['hud_since'] is not None and now-z['hud_since']>=need:
+            events.append(dict(event='zone_left',zone=z['kind'],stale_ms=round(stale*1000,1)))
+            self.zone=None;self.extraction.reset('zone_left');self.transfer.reset()
+            self.hud_fade.reset();self.esc_fade.reset()
+            result['action']='monitor';return result
+        # Extracted / transferred / died inside: HUD gone and it is not a menu.
+        if absent and not suppress_fade:
+            if z['absent_since'] is None:z['absent_since']=now;z['absent_frames']=0
+            z['absent_frames']+=1
+            if z['absent_frames']>=ZONE_DONE_FRAMES and now-z['absent_since']>=ZONE_DONE_SECONDS:
+                return self.zone_finish(result,events,'hud_gone')
+        else:z['absent_since']=None;z['absent_frames']=0
+        # Neither: only counts while no menu is open, so a long inventory visit never ends the pause.
+        if stale>=ZONE_STALE and not complete and not absent and menu_score<.55 and not suppress_fade:
+            z['limbo']+=min(elapsed,.5)
+            if z['limbo']>=ZONE_LIMBO:return self.zone_finish(result,events,'unresolved')
+        result['action']='zone_pause';result['zone']=z['kind'];return result
+
+    def zone_finish(self,result,events,reason):
+        kind=self.zone_kind
+        events.append(dict(event='zone_done',zone=kind,reason=reason))
+        self.zone=None;self.gate.cancel();self.transfer.reset();self.extraction.reset('zone_done')
+        result.update(action='zone_done',zone=kind,reason=reason);return result
+
+    def standby_resume(self,scores,features,menu_present=False):
+        """A new match's full HUD was confirmed during standby: return to ordinary monitoring."""
+        self.zone=None;self.fade_pending=None;self.settings_active=False;self.settings_missing=None
+        self.transfer.reset();self.extraction.reset('standby_resume')
+        self.esc_fade.reset();self.hud_fade.reset();self.layout_changed()
+        self.overlay=SteamOverlayState()
+        return self.gate.arm(scores,menu_present=menu_present,combat_score=features['combat_score'],features=features)
+
+    def set_position_guard(self,active):
+        active=bool(active)
+        if active==self.position_guard:return False
+        self.position_guard=active;self.clear_absence()
+        self.log_last_combat=None;self.log_frames=0;self.log_frame_time=None
+        self.esc_fade.reset();self.hud_fade.reset();self.fade_pending=None;self.last_frame=None
+        return True
 
     def settlement_fast_eligible(self,now,features,menu_score,cue,hint):
         return settlement_context_eligible(now,features,menu_score,cue,hint,self.settlement_context())
 
+    def guards(self):
+        """Single source of truth for 'why a death lane must not fire right now'.
+
+        Each consumer below used to re-list these members in its own words.
+        """
+        countdowns=[t for t in (self.extraction.count_last,self.extraction.zero_last,self.menu_timer_seen) if t is not None]
+        return dict(position=self.position_guard,settings=self.settings_active,
+                    transfer_active=self.transfer.active,transfer_protected=self.transfer.protected,
+                    extraction_latch=self.fade_pending is not None,zone=self.zone is not None,
+                    countdown_until=max([self.log_protection_until]+[t+COUNTDOWN_CONTEXT for t in countdowns]))
+
     def settlement_context(self):
-        protected_until=self.log_protection_until
-        for stamp in (self.extraction.count_last,self.extraction.zero_last,self.menu_timer_seen):
-            if stamp is not None:protected_until=max(protected_until,stamp+3.)
+        g=self.guards()
         return dict(active=self.gate.active,observed_at=self.last_frame,
                     last_combat=self.log_last_combat,last_menu=self.log_last_menu,
-                    protected=bool(self.settings_active or self.transfer.active or self.fade_pending),
-                    protected_until=protected_until)
+                    protected=bool(g['position'] or g['zone'] or g['settings'] or g['transfer_active'] or g['extraction_latch']),
+                    protected_until=g['countdown_until'])
 
     def isolation_context(self):
-        context=self.settlement_context();now=self.last_frame
+        context=self.settlement_context();now=self.last_frame;g=self.guards()
         badge=self.transfer.last_badge
         countdown=bool(now is not None and (now<=self.log_protection_until or
-            (badge is not None and 0<=now-badge<=3.)))
+            (badge is not None and 0<=now-badge<=COUNTDOWN_CONTEXT)))
         weak_fade=any(w.reference is not None and w.falls>=1 and w.last_gain<.98 and
             w.last_drop is not None and now is not None and 0<=now-w.last_drop<=.4
             for w in (self.hud_fade,self.esc_fade))
-        strong=bool(self.settings_active or self.transfer.protected or self.fade_pending)
-        context.update(transition_protected=strong,
-            scene_observation_protected=bool(self.settings_active or self.transfer.protected),
+        scene=bool(g['position'] or g['zone'] or g['settings'] or g['transfer_protected'])
+        context.update(transition_protected=scene or g['extraction_latch'],scene_observation_protected=scene,
             matched_fade_guard=bool(countdown and weak_fade),countdown_observed=countdown,
-            transition_basis=('verified_transfer' if self.transfer.protected else
-                'extraction_candidate' if self.fade_pending else 'settings' if self.settings_active else
+            transition_basis=('lighthouse_position' if g['position'] else 'zone_'+self.zone_kind if g['zone'] else 'verified_transfer' if g['transfer_protected'] else
+                'extraction_candidate' if g['extraction_latch'] else 'settings' if g['settings'] else
                 'weak_structural_fade' if countdown and weak_fade else 'none'))
         return context
 
     def relative_context(self, now, epoch, transition=False):
         # A countdown or menu intent is context, never a death exemption.
         # It only disables this shortcut; ordinary death checks stay active.
-        recent_timer=any(t is not None and 0<=now-t<=3. for t in
-                         (self.extraction.count_last,self.extraction.zero_last,self.menu_timer_seen))
-        allowed=(self.gate.active and not transition and not self.settings_active and
-                 not self.transfer.active and self.fade_pending is None and not recent_timer and
-                 now>self.log_protection_until and self.last_ui_context not in ('esc','settings','inventory') and
-                 self.last_frame is not None and 0<=now-self.last_frame<=.75)
+        g=self.guards()
+        allowed=(self.gate.active and not transition and not (g['position'] or g['zone'] or g['settings'] or g['transfer_active'] or g['extraction_latch'])
+                 and now>g['countdown_until'] and self.last_ui_context not in ('esc','settings','inventory') and
+                 self.last_frame is not None and 0<=now-self.last_frame<=FRESH_FRAME)
         return dict(now=now,epoch=epoch,allowed=bool(allowed))
+
+    @staticmethod
+    def new_latch(now,context,evidence):
+        return dict(time=now,context=context,evidence=evidence,last_support=now,last_seen=now,frames=0)
 
     def begin_display_switch(self, now, source):
         self.settings_active = True
@@ -130,6 +249,7 @@ class DecisionEngine:
         self.gate.last_observation = None
 
     def pause(self):
+        if self.zone is not None:self.zone.update(returned=True,hud_since=None,absent_since=None,absent_frames=0,limbo=0.)
         self.log_last_combat=None;self.log_last_menu=None;self.log_frames=0
         self.clear_absence()
         self.transfer.pause()
@@ -155,6 +275,10 @@ class DecisionEngine:
     def step(self, now, scores, features, menu_score, menu_features, top,
              transfer_cue, extraction_cue, suppress_fade=False, menu_top=None,settlement_hint=None,world=None,black_confirmed=False):
         events = self.pending_events;self.pending_events=[]
+        if self.position_guard:
+            self.clear_absence();self.last_frame=now
+            return dict(action='position_wait',menu_score=1.,events=events,
+                transfer=dict(phase=self.transfer.phase,protected=True,event=None,play_enabled=False))
         overlay=self.overlay.update(now,menu_features.get('interaction_ui',{}).get('steam'),
                                     confirmed_game_ui(features,menu_features))
         if overlay in ('paused_new','paused','waiting'):
@@ -163,20 +287,21 @@ class DecisionEngine:
                         menu_score=1.,overlay_paused=True,events=events,
                         transfer=dict(phase=self.transfer.phase,protected=self.transfer.protected,play_enabled=False))
         if overlay=='resumed':self.pause()
-        if self.last_frame is not None and now-self.last_frame > .75:
+        if self.last_frame is not None and now-self.last_frame > FRESH_FRAME:
             self.log_last_combat=None;self.log_frames=0
             # A resumed frame does not prove what happened while capture stalled.
+            # An already established extraction latch survives: it is resolved
+            # by the fresh frames that follow, within its own budgets.
             self.esc_fade.reset()
             self.hud_fade.reset()
-            self.fade_pending = None
         self.last_frame = now
         combat = features.get('combat_score', 0.)
         visible = start_hud_evidence(features)
         for stamp in (self.extraction.count_last,self.extraction.zero_last,self.menu_timer_seen):
-            if stamp is not None and 0<=now-stamp<=3.:
-                self.log_protection_until=max(self.log_protection_until,stamp+3.)
+            if stamp is not None and 0<=now-stamp<=COUNTDOWN_CONTEXT:
+                self.log_protection_until=max(self.log_protection_until,stamp+COUNTDOWN_CONTEXT)
         if extraction_cue.get('banner') or extraction_cue.get('title_score',0)>=.8:
-            self.log_protection_until=max(self.log_protection_until,now+3.)
+            self.log_protection_until=max(self.log_protection_until,now+COUNTDOWN_CONTEXT)
         if visible and menu_score<.55:self.log_last_combat=now
         if menu_score>=.55:self.log_last_menu=now
         interaction_page=(self.transfer.active and self.transfer.phase in ('confirm','transfer_menu') and
@@ -195,6 +320,9 @@ class DecisionEngine:
             transfer['page_evidence']='fresh_equipment_layout'
             if previous_transfer_phase!='transfer_menu':events.append(dict(event='transfer_interaction_page_visible',phase=transfer['phase']))
         result = dict(action='monitor', menu_score=menu_score, transfer=transfer, events=events)
+        if self.zone_enabled or self.zone is not None:
+            zoned=self.zone_step(now,result,events,combat,visible,absent,menu_score,extraction_cue,suppress_fade,features)
+            if zoned is not None:return zoned
         if transfer['protected']:
             self.clear_absence()
             self.extraction.reset('transfer_protected')
@@ -256,7 +384,7 @@ class DecisionEngine:
         if ui_changed or (suppress_fade and not fast_transit_watch):
             if self.fade_pending:events.append(dict(event='extraction_candidate_cancelled',reason='interface_changed'))
             self.fade_pending=None;self.hud_fade.reset();self.esc_fade.reset()
-        self.extraction.update(now,combat,menu_score>=.55,extraction_cue)
+        if not self.zone_enabled:self.extraction.update(now,combat,menu_score>=.55,extraction_cue)
         near_end=self.extraction.near_end(now) or self.menu_timer_near_end(now)
         observation_suppressed=(suppress_fade and not fast_transit_watch) or ui_changed
         esc = self.esc_fade.update(now, menu_top if menu_top is not None else top, menu_context, observation_suppressed)
@@ -273,11 +401,11 @@ class DecisionEngine:
                 result.update(action='transfer_wait',transfer=dict(phase=self.transfer.phase,protected=True,event='transfer_loading',play_enabled=False));return result
             if not observation_suppressed and near_end and not self.transfer.recent_countdown(now):
                 if self.fade_pending is None:
-                    self.fade_pending=dict(time=now,context=ui_context,evidence=esc,near_end_observed=True,last_support=now)
+                    self.fade_pending=self.new_latch(now,ui_context,esc)
                     events.append(dict(event='extraction_candidate_started',reason='near_end_menu_structural_fade'))
                 # Keep watching the same menu until its UI actually disappears.
                 self.clear_absence();return result
-            if not suppress_fade:
+            if not suppress_fade and self.fade_pending is None:
                 self.gate.cancel();events.append(dict(event='settings_death_fade_confirmed' if menu_context=='settings' else 'esc_death_fade_confirmed',evidence=esc,timer_value=self.menu_timer_value))
                 result.update(action='death',evidence=esc);return result
         if self.transfer.confirm_fade(now, fade):
@@ -295,7 +423,7 @@ class DecisionEngine:
             self.extraction.reset('transit_countdown');self.fade_pending=None
         if fade['confirmed'] and not transit and near_end and not observation_suppressed:
             if self.fade_pending is None:
-                self.fade_pending=dict(time=now,context=ui_context,evidence=fade,near_end_observed=True,last_support=now)
+                self.fade_pending=self.new_latch(now,ui_context,fade)
                 events.append(dict(event='extraction_candidate_started',reason='near_end_hud_structural_fade'))
         if self.fade_pending:
             pending=self.fade_pending
@@ -311,36 +439,39 @@ class DecisionEngine:
             rebound=gain is not None and gain>minimum+.08
             if gain is not None and (current.get('confirmed') or current.get('matched')):
                 pending['min_gain']=min(minimum,gain)
-            # A confirmed near-end structural fade can outlive the last readable
-            # timer glyph by one sample. Don't discard it at the glyph's TTL
-            # boundary immediately before the HUD disappears on a slow machine.
-            # This is a bounded observed sequence, never a general safe zone.
             support_age=now-pending.get('last_support',pending['time'])
-            # Only a fully certified black frame may bridge one slow capture
-            # after an ALREADY confirmed near-end structural fade. This never
-            # creates a candidate or extends its original one-second deadline.
-            terminal_black=(black_confirmed and absent and not observation_suppressed and
-                            pending.get('min_gain',1.)<=.65 and 0<=support_age<=.75)
-            supported=(pending.get('near_end_observed',False) and now-pending['time']<=1.
-                       and (support_age<=.5 or terminal_black))
+            age=now-pending['time']
+            if now>pending['last_seen']:pending['frames']+=1;pending['last_seen']=now
+            # Counter-evidence: the player is still in the raid.
             restarted=(extraction_cue.get('banner') and self.extraction.count_value is not None
                        and self.extraction.count_value>1)
+            # A fading HUD keeps single channels above start thresholds for
+            # several frames, so "HUD visible" alone is NOT recovery.
             recovered=(visible and combat>=.48 and current.get('reason')=='baseline_updated')
-            invalid=(ui_changed or suppress_fade or (not near_end and not supported) or now-pending['time']>1.
-                     or rebound or restarted or recovered)
-            if invalid:
-                events.append(dict(event='extraction_candidate_cancelled',reason='transition_timer_expired_or_brightened',
-                                   pending_age_ms=round((now-pending['time'])*1000,3),support_age_ms=round(support_age*1000,3),
+            cancel=ui_changed or suppress_fade or rebound or restarted or recovered
+            if cancel:
+                events.append(dict(event='extraction_candidate_cancelled',reason='extraction_counter_evidence',
+                                   pending_age_ms=round(age*1000,3),support_age_ms=round(support_age*1000,3),frames=pending['frames'],
                                    near_end=bool(near_end),ui_changed=bool(ui_changed),suppressed=bool(suppress_fade),
                                    rebound=bool(rebound),restarted=bool(restarted),recovered=bool(recovered)))
                 self.fade_pending=None
-            elif absent and now-pending['time']>=.06:
-                evidence=dict(policy='near_end_structural_fade_then_ui_absent',
-                              terminal_black_bridge=bool(terminal_black and support_age>.5),
-                              countdown=self.extraction.trace(now),menu_timer=self.menu_timer_value,
+            elif absent and age>=.06:
+                evidence=dict(policy='near_end_structural_fade_then_ui_absent',latch_frames=pending['frames'],
+                              latch_age_ms=round(age*1000,3),countdown=self.extraction.trace(now),menu_timer=self.menu_timer_value,
                               **pending['evidence'])
                 self.fade_pending=None;self.gate.cancel()
                 result.update(action='extraction',evidence=evidence);return result
+            elif (pending['frames']>=LATCH_FRAME_BUDGET and age>=LATCH_MIN_SECONDS) or age>=LATCH_WALL_CAP:
+                # Neither extraction nor a return to the raid was observed. Stop
+                # without exiting: guessing "death" here is what caused false exits.
+                events.append(dict(event='extraction_latch_unresolved',frames=pending['frames'],latch_age_ms=round(age*1000,3)))
+                self.fade_pending=None;self.gate.cancel()
+                result.update(action='uncertain',reason='撤离过程未能确认，已停止监控（未执行退出），请确认后重新开启')
+                return result
+            else:
+                # Latch held: this frame is part of the extraction blackout and
+                # feeds no death lane (ordinary absence, relative fade or log fast path).
+                self.clear_absence();return result
         relative=features.get('relative_death',{})
         if relative.get('certified') and absent and all(features.get(k,0)<v for k,v in (('body_shape',.2),('bar_frames',.15),('label_shape',.2))) and not transit and not self.transfer.active and not suppress_fade and not near_end and self.fade_pending is None:
             self.gate.cancel();events.append(dict(event='relative_death_confirmed',evidence=relative))

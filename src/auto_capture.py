@@ -80,6 +80,8 @@ class AutoCapture:
             if not self.handle:raise RuntimeError(self._error())
         else:
             import dxcam
+            from dxcam_lifetime import install
+            install()
             self.raw=dxcam.create(output_color='BGRA')
         self.metadata=dict(backend=self.route,configuration_generation=self.generation,displays=self.state,cached=True)
         return True

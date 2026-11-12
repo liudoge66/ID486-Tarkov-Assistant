@@ -8,4 +8,4 @@ if EDITION not in ('', 'PMC', 'Fence'):
 FENCE = EDITION != 'PMC'
 NETWORK = True
 VERSION = 'V0.3'
-BUILD = '2026.11.04-v0.3-release-52'
+BUILD = '2026.11.12-v0.3-dxcam-lifetime-65'

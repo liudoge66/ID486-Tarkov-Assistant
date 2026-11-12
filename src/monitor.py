@@ -14,6 +14,9 @@ from tkinter import ttk, filedialog
 from tkinterdnd2 import TkinterDnD, DND_FILES
 from sound_library import SoundLibrary
 from app_storage import load_settings, writable_data_directory
+from raid_scope import game_rejection, TITLE as ONLINE_TITLE, CAPTION as ONLINE_CAPTION
+from lighthouse_position import LocationMonitor,ScreenshotRetention,bind_session,default_screenshot_roots
+from game_keys import analyze as analyze_screenshot_binding
 from primary_ui import PrimaryUI
 from tkinter import simpledialog
 from hotkey_service import Hotkeys, PRESETS as HOTKEY_PRESETS, label as hotkey_label, validate as validate_hotkey
@@ -28,7 +31,7 @@ from esc_audit import EscAudit,title_skip_reason
 from ui_fade import UniformFadeWatch
 from transfer import TransferDetector,TransferFlow,resume_hud
 from keyboard_diagnostics import KeyboardDiagnostics
-from decision import DecisionEngine
+from decision import DecisionEngine,ZONE_STANDBY_INTERVAL,ZONE_STANDBY_CONFIRM_GAP,ZONE_STANDBY_CONFIRM_MAX
 from process_exit import GameProcess
 from edition import FENCE, NETWORK, EDITION, VERSION, BUILD
 from event_log import EventJournal
@@ -268,7 +271,7 @@ class App:
         self.root.iconbitmap(str(icon_path()))
         self.window_icons=WindowIcons(self.root)
         self.lock=threading.RLock();self.token=0;self.active=False;self.arming=False;self.closed=False
-        self.capture_session=None;self.parallel_session=None
+        self.capture_session=None;self.parallel_session=None;self.position_session=None
         self.pending=queue.Queue();self.ui=queue.Queue();self.gate=Gate();self.detector=Detector()
         base=Path(sys.executable).parent if getattr(sys,'frozen',False) else Path(__file__).parent
         legacy_base=base
@@ -302,6 +305,9 @@ class App:
                 self.jsonl_log=open(base/'monitor_events.jsonl','a',encoding='utf-8',buffering=1)
         self.journal=EventJournal(self.log,jsonl_only,jsonl_stream=self.jsonl_log);self.exit_enabled=False
         self.network=None;self.network_var=tk.BooleanVar(value=False)
+        # "监控自动暂停": off by default; worker threads read the plain bool, never the Tk variable.
+        self.zone_var=tk.BooleanVar(value=False);self.zone_allowed=False
+        self.zone_view=None;self.zone_hold=False;self.zone_clear_job=None
         self.network_allowed=False;self.network_session_started=False;self.network_request_revision=0
         self.network_status=tk.StringVar(value='联网控制未开启');self.network_seconds=120;self.network_local_pve=False
         if NETWORK:
@@ -311,6 +317,8 @@ class App:
         self.event('keyboard_diagnostics_ready',available=self.keyboard_diagnostics.available,error=self.keyboard_diagnostics.error,pre_seconds=15,post_seconds=15,scope='monitor armed + foreground game PID; post-trigger 15s',temporary=True)
         self.config_path=base/'settings.json'
         self._loaded_preferences=load_settings(self.config_path)
+        self.zone_allowed=self._loaded_preferences.get('zone_auto_pause') is True
+        self.zone_var.set(self.zone_allowed)
         if NETWORK:
             self.network_allowed=self._loaded_preferences.get('network_allowed') is True
             self.network_local_pve=True # PvE application scope; the removed dialog is not a hidden gate.
@@ -382,6 +390,7 @@ class App:
         self.detailed_logs=self.log_var.get()
         self.collect_var.set(preferences.get('collect_screenshots',False) is True);self.collect_enabled=self.collect_var.get()
         self.prep_feedback=tk.StringVar(value='');self.advanced_feedback=tk.StringVar(value='')
+        self.screenshot_hint=tk.StringVar(value='');self.next_key_check=0.
         self.sound_vars={};self.sound_boxes={};self.audio_window=None
         self.sound_hint=tk.StringVar(value='WAV / MP3 / FLAC / OGG · 50MB / 60秒以内')
         style=ttk.Style(self.root);style.theme_use('clam')
@@ -447,6 +456,22 @@ class App:
         self.network_status.set(self.network_standby_text())
         self.write_preferences(network_allowed=True,network_local_pve=True)
         self.event('network_permission_changed',allowed=True)
+
+    def open_project(self):
+        try:
+            import webbrowser
+            webbrowser.open('https://github.com/liudoge66/ID486-Tarkov-Assistant')
+        except Exception:
+            self.prep_feedback.set('无法打开浏览器，请手动访问项目地址')
+
+    def toggle_zone(self):
+        """Switch "监控自动暂停". Takes effect on the running worker within one frame."""
+        with self.lock:
+            self.zone_allowed=not self.zone_allowed;self.zone_var.set(self.zone_allowed)
+            try:self.write_preferences(zone_auto_pause=self.zone_allowed)
+            except OSError:self.prep_feedback.set('保存失败，请检查程序目录写入权限')
+            if not self.zone_allowed:self.zone_view=None;self.zone_hold=False
+            self.event('zone_auto_pause_changed',enabled=self.zone_allowed)
 
     def open_network_settings(self):
         # Compatibility for old callbacks: the field is now a binary toggle.
@@ -696,7 +721,9 @@ class App:
 
     def cancel(self,reason):
         with self.lock:
+            if getattr(self,'position_session',None):self.position_session.close(wait=False)
             self.token+=1;self.active=False;self.arming=False;self.exit_enabled=False;self.gate.cancel()
+            self.zone_view=None;self.zone_hold=False
             self.stop_network_session()
             if getattr(self,'keyboard_diagnostics',None):self.keyboard_diagnostics.pause()
             self.event('disarmed',reason=reason)
@@ -721,6 +748,81 @@ class App:
             self.token+=1;token=self.token;self.arming=True
             self.pending.put((token,info,self.dry.get()))
             self.ui.put(('status','正在检查当前 HUD，请保持游戏前台…'))
+
+    def reject_raid_scope(self,token,reason):
+        with self.lock:
+            if token!=self.token or self.closed:return
+            self.cancel(reason)
+            self.event('arm_rejected',reason=reason,source='raid_scope')
+            self.ui.put(('raid_scope_blocked',dict(token=self.token)))
+
+    def position_guard_active(self,token):
+        position=getattr(self,'position_session',None)
+        return bool(position and position.token==token and token==self.token and self.active and
+                    position.snapshot()['protected'])
+
+    def position_end_request(self,token,hint):
+        with self.lock:
+            if token==self.token and self.active and not self.position_guard_active(token) and self.network:
+                self.network.end_request(hint,monitor_token=token)
+
+    def position_candidate(self,token,candidate):
+        with self.lock:
+            if token!=self.token or not self.active:return
+            if self.position_guard_active(token):candidate=dict(action='cancel',reason='lighthouse_position')
+            if self.network:self.network.candidate_update(candidate,monitor_token=token)
+
+    def start_position_session(self,token,info,game,folder=None,paused=False):
+        preferences=load_settings(self.config_path) if getattr(self,'config_path',None) else getattr(self,'_loaded_preferences',{})
+        if preferences.get('lighthouse_position_enabled',True) is not True:return None
+        try:
+            # The game's own MakeScreenshot binding, checked against Windows,
+            # Steam, other programs' hotkeys, the game's other actions and F10.
+            binding=analyze_screenshot_binding(preferences,tool_combo=getattr(self.hotkey_service,'combo',None))
+            if not binding['usable']:raise ValueError(binding['hint'])
+            keys=binding['keys']
+            roots=(Path(preferences['lighthouse_screenshot_directory']),) if preferences.get('lighthouse_screenshot_directory') else default_screenshot_roots()
+            retention=None
+            if getattr(self,'config_path',None):
+                try:limit=min(50,max(0,int(preferences.get('lighthouse_screenshot_keep',5))))
+                except (TypeError,ValueError):limit=5
+                retention=ScreenshotRetention(self.config_path.parent/'lighthouse_screenshots.json',roots,limit)
+            if folder is None:folder=bind_session(game.executable.parent/'Logs',game.creation_unix,time.time())
+            zone=json.loads((Path(__file__).parent/'assets/lighthouse_zone.json').read_text(encoding='utf-8'))
+            override=preferences.get('lighthouse_zone')
+            if isinstance(override,dict):zone.update(override)
+            def alive():return token==self.token and self.active and not self.closed
+            def foreground():return alive() and foreground_owner(info) and (target() or ())[:2]==info[:2]
+            def press():
+                # Skip while the player holds a modifier or any key of the binding.
+                if not foreground() or any(U.GetAsyncKeyState(v)&0x8000 for v in (0x10,0x11,0x12,0x5b,0x5c)+tuple(k[0] for k in keys)):return None
+                packet=lambda key,flags:(INPUT*1)(INPUT(type=1,u=INPUTUNION(ki=KEYBDINPUT(key[0],key[1],key[2]|flags,0,0))))
+                accepted=False
+                try:
+                    accepted=True
+                    for key in keys:  # modifiers first, main key last
+                        if U.SendInput(1,packet(key,0),C.sizeof(INPUT))!=1:accepted=False;break
+                    if accepted:time.sleep(.04)
+                finally:
+                    released=True
+                    for key in reversed(keys):  # release everything, even after a failure
+                        if U.SendInput(1,packet(key,2),C.sizeof(INPUT))!=1 and U.SendInput(1,packet(key,2),C.sizeof(INPUT))!=1:released=False
+                return accepted and released
+            def status(payload):
+                if not alive():return
+                if payload['protected'] and self.network:self.network.candidate_update(dict(action='cancel',reason='lighthouse_position'),monitor_token=token)
+                self.ui.put(('position_status',dict(payload,token=token)))
+            position=LocationMonitor(folder,zone,roots,press,alive,foreground,self.event,status,action_lock=self.lock,retention=retention)
+            position.token=token;self.position_session=position
+            if paused:position.set_paused(True)
+            position.start()
+            self.event('lighthouse_position_started',pid=info[1],session=folder.name,key=binding['label'],key_vk=[k[0] for k in keys],
+                       warnings=binding['warnings'],cadence=position.policy.cadence,keep=None if retention is None else retention.limit)
+            return position
+        except (OSError,ValueError,TypeError,KeyError,AttributeError) as exc:
+            self.event('lighthouse_position_error',reason=str(exc),error_type=type(exc).__name__)
+            self.ui.put(('position_status',dict(token=token,unavailable=True,reason=str(exc))))
+            return None
 
     def validate_observation_owner(self,token,info,engine,action,force_pause=False):
         """Reject a decision without consuming the armed session if focus moved.
@@ -773,10 +875,14 @@ class App:
                    read_to_visual_ms=record.get('read_to_finish_ms'))
 
     def parallel_death(self,token,info,engine,exit_target,capture,packet):
+        blocked=game_rejection(exit_target)
+        if blocked:
+            self.reject_raid_scope(token,blocked);return False
         # The normal death branch uses this same app lock and invalidates the
         # same token. Only one branch can accept and consume a live session.
         with self.lock:
             if token!=self.token or not self.active or self.closed:return False
+            if self.position_guard_active(token):return False
             if not foreground_owner(info) or target()!=info or U.GetAsyncKeyState(0x1B)&0x8000:return False
             if packet['guard_epoch']!=capture.epoch:return False
             continuity=getattr(self,'hud_continuity',None)
@@ -815,12 +921,39 @@ class App:
         self.ui.put(('status','已关闭 · '+message))
         return True
 
+    def queue_game_restart(self,token,info,dry):
+        """Invalidate the dead process binding before releasing its worker resources."""
+        with self.lock:
+            if token!=self.token or not self.active or self.closed:return False
+            self.token+=1;token=self.token
+            self.arming=True;self.zone_hold=True;self.gate.cancel()
+            self.stop_network_session()
+            if getattr(self,'keyboard_diagnostics',None):self.keyboard_diagnostics.pause()
+            self.event('zone_restart_wait_started',old_pid=info[1])
+            self.ui.put(('zone_status',dict(token=token,state='restart')))
+            self.pending.put((token,None,dry,True))
+            return True
+
+    def wait_game_restart(self,token):
+        """Wait without capture or audio; the new worker validates process and logs."""
+        while True:
+            with self.lock:
+                if token!=self.token or not self.active or self.closed:return None
+            info=target()
+            if info is not None:return info
+            time.sleep(.25)
+
     def worker(self):
         while not self.closed:
-            try: token,info,dry=self.pending.get(timeout=.05)
+            try: request=self.pending.get(timeout=.05)
             except queue.Empty:continue
+            token,info,dry=request[:3]
+            restarting=len(request)>3 and request[3]
             with self.lock:
                 if token!=self.token or self.closed:continue
+            if restarting and info is None:
+                info=self.wait_game_restart(token)
+                if info is None:continue
             hz=self.capture_hz
             interval=1/hz
             self.gate.max_observation_gap=max(.12,2.5/hz)
@@ -829,7 +962,7 @@ class App:
             camera=None
             esc_audit=None
             continuity=None
-            settlement_watch=None
+            settlement_watch=None;position_watch=None
             parallel_check=None;parallel_target=None
             engine=DecisionEngine(self.gate);extraction_guard=engine.extraction;exit_target=None
             isolation_candidate=IsolationCandidate();engine.isolation_candidate=isolation_candidate
@@ -858,6 +991,13 @@ class App:
                 cap_ms=[];analysis_ms=[];esc_fast_ms=[];death_fast_ms=[];parallel_ui_ms=[];title_reuses=0;newer_frame_vetoes=0;attempts=0;new_frames=0
                 window_start=time.perf_counter();cpu_start=time.process_time()
             try:
+                exit_target=GameProcess(info[1])
+                if restarting and not exit_target.handle:
+                    time.sleep(.25)
+                    self.pending.put((token,None,dry,True));continue
+                blocked=game_rejection(exit_target)
+                if blocked:
+                    self.reject_raid_scope(token,blocked);continue
                 import dxcam
                 def capture_safe():
                     return ((self.active or self.arming) and token==self.token and not self.closed and foreground_owner(info)
@@ -876,9 +1016,14 @@ class App:
                 with self.lock:
                     if token!=self.token or self.closed:continue
                 if frame is None:
+                    if restarting:
+                        self.pending.put((token,None,dry,True));continue
                     self.cancel('采集暂时没有画面，请保持游戏前台，稍后重新按快捷键');continue
                 confirmation=ArmConfirmation(hz);confirmed=False;arm_deadline=deadline
+                if restarting:arm_deadline=0.  # Rebind into standby, never the one-frame manual arm path.
                 scores=(0.,0.);menu_score=0.
+                if restarting:
+                    scores,menu_score=self.detector.analyze(frame,full_size=(info[2],info[3]))
                 while time.perf_counter()<arm_deadline:
                     with self.lock:
                         if token!=self.token or self.closed:break
@@ -888,29 +1033,43 @@ class App:
                         scores,menu_score=self.detector.analyze(frame,full_size=(info[2],info[3]))
                         if menu_score<.55 and confirmation.update(self.detector.last_features,time.perf_counter()):confirmed=True;break
                     time.sleep(interval);frame=camera.grab(region=region,copy=False)
+                blocked=game_rejection(exit_target)
+                if blocked:
+                    self.reject_raid_scope(token,blocked);continue
                 with self.lock:
                     if token!=self.token or self.closed:continue
                     self.arming=False
-                    if not confirmed or target()!=info or not self.gate.arm(scores,menu_present=menu_score>=.55,combat_score=self.detector.last_features["combat_score"],features=self.detector.last_features):
+                    armed_ok=bool(confirmed and target()==info and self.gate.arm(scores,menu_present=menu_score>=.55,combat_score=self.detector.last_features["combat_score"],features=self.detector.last_features))
+                    standby=bool(not armed_ok and (self.zone_allowed or restarting) and target()==info)
+                    if not armed_ok and not standby:
+                        if restarting:
+                            self.arming=True;self.pending.put((token,None,dry,True));continue
                         self.event('arm_rejected',reason='首次开启需要战斗HUD，菜单不能单独开启',arm_policy=confirmation.summary(),scores=scores,menu_score=menu_score,
                             frame_size=list(frame.shape[:2]) if frame is not None else None,expected_size=list(shape),features=self.detector.last_features,menu_features=self.detector.last_menu_features,extraction_cues=getattr(self.detector,'last_extraction',{}))
                         self.cancel('未观察到战斗HUD，请在血量人形与快捷栏可见时开启');continue
-                    if hasattr(self.detector,'lock_current_layout'):self.detector.lock_current_layout()
+                    if armed_ok and hasattr(self.detector,'lock_current_layout'):self.detector.lock_current_layout()
                     self.active=True
-                    exit_target=GameProcess(info[1])
                     self.event('exit_target_bound',pid=info[1],bound=bool(exit_target.handle),direct=exit_target.can_terminate,error=exit_target.error)
-                    self.start_network_session(token,info)
+                    if not restarting:self.start_network_session(token,info)
                     if getattr(self,'keyboard_diagnostics',None):self.keyboard_diagnostics.start(info[1])
                     self.event('armed',arm_policy=confirmation.summary(),dry_run=dry,scores=scores,menu_score=menu_score,
                         delay_ms=self.gate.delay_ms,capture_hz=hz,capture_region=list(region),features=self.detector.last_features,menu_features=self.detector.last_menu_features,extraction_cues=getattr(self.detector,'last_extraction',{}))
-                    self.ui.put(('status','监控中 · '+('只记录，不退出' if dry else '战斗 HUD 和菜单均消失并超过设定延时才退出')))
+                    if standby:
+                        self.zone_hold=True
+                        if restarting:self.event('zone_restart_rebound',pid=info[1],creation_unix=exit_target.creation_unix)
+                        self.event('zone_standby_started',reason='game_restarted' if restarting else 'armed_without_hud',menu_score=menu_score)
+                        self.ui.put(('zone_status',dict(token=token,state='standby',cue=True)))
+                    else:self.ui.put(('status','监控中 · '+('只记录，不退出' if dry else '战斗 HUD 和菜单均消失并超过设定延时才退出')))
                 if getattr(exit_target,'creation_unix',None) is not None:
                     try:
                         settlement_watch=SettlementWatch(exit_target.executable.parent/'Logs',exit_target.creation_unix,info[1],self.event,
-                            on_request=lambda hint:self.network.end_request(hint,monitor_token=token) if self.network else None)
+                            on_request=lambda hint:self.position_end_request(token,hint))
                         settlement_watch.start()
                     except (OSError,ValueError) as exc:self.event('settlement_watch_error',pid=info[1],error_type=type(exc).__name__)
+                if getattr(exit_target,'creation_unix',None) is not None:
+                    position_watch=self.start_position_session(token,info,exit_target,settlement_watch.folder if settlement_watch else None,paused=standby)
                 last_new=time.perf_counter();last_ui=0;paused=False;capture_waiting=False;settings_transition=False;next_tick=last_new
+                standby_hit=None;standby_next=0.;standby_seq=-1
                 settlement_probe_id=None
                 title_detector=EscTitleDetector();esc_expanded=False;esc_requested=-100.;esc_down=False
                 esc_audit=EscAudit(self.config_path.parent/'esc_diagnostics',self.event,images=self.collect_enabled)
@@ -933,7 +1092,7 @@ class App:
                     parallel_target=GameProcess(info[1])
                     def parallel_owner():
                         return (token==self.token and self.active and not self.closed and not steam_paused and foreground_owner(info)
-                            and target()==info and not bool(U.GetAsyncKeyState(0x1B)&0x8000)
+                            and target()==info and not self.position_guard_active(token) and not bool(U.GetAsyncKeyState(0x1B)&0x8000)
                             and geometry_signature(info)==last_geometry)
                     parallel_check=ParallelSettlementCheck(camera,settlement_watch,FastProbe(),parallel_owner,
                         lambda packet,fast_camera=camera:self.parallel_death(token,info,engine,parallel_target,fast_camera,packet),self.parallel_report)
@@ -961,9 +1120,19 @@ class App:
                             delay_ms=self.gate.delay_ms,capture_hz=hz,full_size=[info[2],info[3]],
                             esc_capture_expanded=esc_expanded,capture_region=list(region),capture_source=camera.delivered.provenance,
                             absence_ms_before_decision=0 if self.gate.missing_since is None else (stamp-self.gate.missing_since)*1000))
+                next_scope_check=0.
                 while True:
+                    if standby and exit_target.handle and K.WaitForSingleObject(exit_target.handle,0)==0:
+                        self.queue_game_restart(token,info,dry)
+                        break
+                    if time.perf_counter()>=next_scope_check:
+                        next_scope_check=time.perf_counter()+.25
+                        blocked=game_rejection(exit_target)
+                        if blocked:
+                            self.reject_raid_scope(token,blocked);break
                     with self.lock:
                         if not self.active or token!=self.token or self.closed:break
+                        engine.zone_enabled=self.zone_allowed
                         if hz!=self.capture_hz:
                             hz=self.capture_hz;interval=1/hz;next_tick=time.perf_counter()
                             camera.set_hz(hz)
@@ -1027,6 +1196,58 @@ class App:
                         if transfer_flow.active:self.ui.put(('transfer_status',dict(token=token,phase=transfer_flow.phase,resumed=False)))
                         else:self.ui.put(('status','监控中 · 已回到游戏，继续判断'))
                         paused=False
+                    if standby:
+                        # Low-frequency standby: one full frame every few seconds, silent, no death lane.
+                        if time.perf_counter()<standby_next:
+                            time.sleep(.05);continue
+                        standby_frame=camera.grab(region=(0,0,info[2],info[3]),copy=False)
+                        if (standby_frame is None or standby_frame.shape[:2]!=(info[3],info[2]) or not camera.delivered.safe
+                                or camera.delivered.sequence==standby_seq):
+                            standby_next=time.perf_counter()+.3;time.sleep(.05);continue  # a missed grab retries soon, not in a tight loop
+                        standby_seq=camera.delivered.sequence;standby_stamp=camera.capture_time
+                        standby_next=time.perf_counter()+ZONE_STANDBY_INTERVAL
+                        if standby_hit is None and hasattr(self.detector,'reset_layout'):self.detector.reset_layout()
+                        standby_scores,standby_menu=self.detector.analyze(standby_frame,full_size=(info[2],info[3]))
+                        standby_features=dict(self.detector.last_features)
+                        if standby_menu<.55 and resume_hud(standby_features):
+                            if standby_hit is None or standby_stamp-standby_hit>ZONE_STANDBY_CONFIRM_MAX:
+                                standby_hit=standby_stamp;standby_next=time.perf_counter()+ZONE_STANDBY_CONFIRM_GAP;continue
+                            if standby_stamp-standby_hit<.05:continue
+                            blocked=game_rejection(exit_target)
+                            if blocked:
+                                self.reject_raid_scope(token,blocked);break
+                            with self.lock:
+                                if token!=self.token or not self.active or self.closed:break
+                                resumed=engine.standby_resume(standby_scores,standby_features)
+                                if resumed:
+                                    standby=False;self.zone_hold=False
+                                    if position_watch:
+                                        position_watch.set_paused(False)
+                                        position_watch.confirm_hud(standby_stamp)
+                                    if restarting:
+                                        self.start_network_session(token,info)
+                                        restarting=False
+                                    if hasattr(self.detector,'lock_current_layout'):self.detector.lock_current_layout()
+                            if not resumed:
+                                standby_hit=None;continue
+                            standby_hit=None;extraction_trace.clear();isolation_candidate.reset();camera.invalidate()
+                            force_full_after_focus=True;last_new=time.perf_counter();last_transfer_phase=None;esc_expanded=False
+                            if self.network:self.network.scene(resumed=True,monitor_token=token)
+                            self.event('zone_standby_resumed',features=standby_features)
+                            self.ui.put(('zone_status',dict(token=token,state='raid')))
+                        else:standby_hit=None
+                        continue
+                    protected=self.position_guard_active(token)
+                    position_changed=engine.set_position_guard(protected)
+                    if position_changed:
+                        isolation_candidate.reset();camera.invalidate();force_full_after_focus=True
+                        if diagnostic:diagnostic.reset()
+                    if protected:
+                        if position_changed or force_full_after_focus:
+                            self.ui.put(('position_status',dict(self.position_session.snapshot(),token=token)))
+                            force_full_after_focus=False
+                        if parallel_check:parallel_check.publish(dict(active=False))
+                        last_new=time.perf_counter();time.sleep(.05);continue
                     # Escape only expands observation; it never means 'menu is present'.
                     keyboard=getattr(self,'keyboard_diagnostics',None)
                     serial=getattr(keyboard,'escape_serial',esc_serial)
@@ -1106,6 +1327,8 @@ class App:
                                 transfer_ticket=ReviewTicket(lambda:transfer_detector.detect(early_menu,frame,(info[2],info[3]),early_layout),review_layout,frame)
                     try:
                         scores,menu_score=self.detector.analyze(frame,full_size=(info[2],info[3]))
+                        if position_watch and menu_score<.55 and resume_hud(self.detector.last_features):
+                            position_watch.confirm_hud(camera.capture_time)
                     finally:
                         # Drain the two jobs before any following frame can use these actors.
                         try:
@@ -1318,6 +1541,27 @@ class App:
                     if ownership=='stopped':break
                     if ownership=='paused':paused=True;continue
                     transfer_result=outcome['transfer'];menu_score=outcome['menu_score'];settings_transition=engine.settings_active
+                    if outcome['action'] in ('zone_pause','zone_done'):
+                        # Auto-pause: log, cancel any temporary isolation, never judge death.
+                        for record in outcome['events']:
+                            kind=record['event'];detail={k:v for k,v in record.items() if k!='event'}
+                            self.event(kind,**detail,features=dict(self.detector.last_features))
+                            if kind=='zone_entered':
+                                self.ui.put(('zone_status',dict(token=token,state='paused',zone=record.get('zone'))))
+                        self.zone_hold=True
+                        isolation_candidate.reset()
+                        self.position_candidate(token,dict(action='cancel',reason='zone_auto_pause'))
+                        if outcome['action']=='zone_done':
+                            standby=True;standby_hit=None;standby_next=time.perf_counter()+ZONE_STANDBY_INTERVAL
+                            if position_watch:position_watch.set_paused(True)
+                            camera.invalidate()
+                            if parallel_check:parallel_check.publish(dict(active=False))
+                            if self.network:self.network.scene(settled=True,monitor_token=token)
+                            self.ui.put(('zone_status',dict(token=token,state='standby')))
+                        collect(outcome['action'],now)
+                        analysis_ms.append((time.perf_counter()-begin)*1000)
+                        if now-window_start>=5:performance()
+                        continue
                     # Network-only candidate: every input already passed complete UI,
                     # title, ownership and newer-frame vetoes. Never changes Gate.
                     ccontext=engine.isolation_context()
@@ -1343,7 +1587,7 @@ class App:
                     if candidate_result['action']!='none' and outcome['action']!='death':
                         self.event('network_candidate_visual',pid=info[1],frame_sequence=camera.delivered.sequence,
                             frame_wall_ns=camera.delivered.wall_ns,evidence=candidate_result)
-                        if self.network:self.network.candidate_update(candidate_result,monitor_token=token)
+                        self.position_candidate(token,candidate_result)
 
                     if self.network and self.network.enabled:
                         self.network.normal_observation(monitor_token=token,observed_at=now,
@@ -1363,6 +1607,8 @@ class App:
                         self.event(kind,**detail,features=dict(self.detector.last_features))
                         if kind=='display_switch_guard_started':self.ui.put(('status','监控中 · 已确认显示参数切换，正在重新定位画面'))
                         elif kind=='settings_transition_resumed':self.ui.put(('status','监控中 · 已重新定位战斗HUD，继续判断'))
+                        elif kind=='zone_left':
+                            self.zone_hold=False;self.ui.put(('zone_status',dict(token=token,state='left',zone=detail.get('zone'))))
                         elif kind=='transfer_hint_cancelled':
                             self.ui.put(('transfer_status',dict(token=token,phase='idle',resumed=False,hint_cancelled=True)))
                             last_transfer_phase=None
@@ -1371,6 +1617,9 @@ class App:
                         self.ui.put(('transfer_status',dict(token=token,phase=transfer_result['phase'],resumed=False)))
                         last_transfer_phase=transfer_result['phase']
                     if transfer_result['play_enabled']:
+                        blocked=game_rejection(exit_target)
+                        if blocked:
+                            self.reject_raid_scope(token,blocked);break
                         if self.network:self.network.scene(resumed=True,monitor_token=token)
                         if hasattr(self.detector,'lock_current_layout'):self.detector.lock_current_layout()
                         self.ui.put(('transfer_status',dict(token=token,phase='idle',resumed=True)))
@@ -1412,6 +1661,8 @@ class App:
                             ownership=self.validate_observation_owner(token,info,engine,'death')
                             if ownership=='stopped':break
                             if ownership=='paused':paused=True;continue
+                            if self.position_guard_active(token):
+                                engine.set_position_guard(True);continue
                             dry=self.runtime_dry or not self.exit_enabled
                             exit_watch=None
                             if dry:
@@ -1479,6 +1730,8 @@ class App:
             except Exception as exc:
                 self.cancel('采集/检测错误：'+str(exc))
             finally:
+                if position_watch:position_watch.close()
+                if getattr(self,'position_session',None) is position_watch:self.position_session=None
                 if parallel_check:parallel_check.close()
                 if continuity:
                     continuity.close();self.event('hud_continuity_audit',checked_frames=continuity.checked,errors=continuity.errors)
@@ -1532,6 +1785,18 @@ class App:
         try:
             while True:
                 kind,text=self.ui.get_nowait()
+                if kind=='position_status':
+                    if text.get('token')!=self.token or not self.active:continue
+                    self.position_feedback(text)
+                    continue
+                if kind=='zone_status':
+                    if text.get('token')!=self.token or not self.active:continue
+                    self.zone_feedback(text)
+                    continue
+                if kind=='status' and self.zone_view is not None and self.active and text.startswith('监控中'):
+                    # Focus/capture notices must not replace the zone state: show them as a prefix only, silently.
+                    caption=self.zone_view['caption']
+                    self.status.set(('已切出游戏 · ' if '已切出游戏' in text else '')+caption);continue
                 if kind=='network_status':
                     payload=text if isinstance(text,dict) else dict(text=text,revision=self.network_request_revision)
                     with self.lock:
@@ -1574,6 +1839,10 @@ class App:
                     continue
                 if kind=='diagnostic_saved':
                     self.diagnostic_status.set('诊断已保存：'+text);continue
+                if kind=='raid_scope_blocked':
+                    if text['token']!=self.token:continue
+                    self.status.set(ONLINE_CAPTION);self.state_head.set(ONLINE_TITLE);self.bottom_status.set(ONLINE_TITLE)
+                    continue
                 if kind=='overlay_waiting':
                     self.status.set(text);self.state_head.set('已暂停 · 等待确认游戏界面')
                     self.bottom_status.set('保持暂停 · F10可停止监控')
@@ -1599,10 +1868,96 @@ class App:
                     feedback=self.notice.show(text)
                     self.event('status_feedback',status=text,**feedback)
         except queue.Empty:pass
+        self.check_screenshot_key()
         if not self.closed:self.root.after(10,self.tick)
 
+    ZONE_LEFT='监控中 · 已离开商人区域，恢复大退'
+    # kind -> (big state text, small caption)
+    ZONE_TEXT={'extraction':('撤离区域 · 已自动暂停','不判定死亡 · 离开撤离区域自动恢复'),
+               'transfer':('转移区域 · 已自动暂停','不判定死亡 · 离开转移区域自动恢复'),
+               'lighthouse':('灯塔区域 · 不判定死亡','离开商人区域自动恢复')}
+
+    def zone_feedback(self,payload):
+        """Auto-pause states from the worker (UI thread). One beep on pause / leave / new match; standby is silent."""
+        state=payload.get('state');kind=payload.get('zone') or 'extraction'
+        def beep(name=None):
+            if '--smoke-test' in sys.argv:return
+            try:
+                if name is None:self.sounds.play_cue('enabled.wav')
+                elif not self.sounds.muted and self.sounds.enabled.get('enabled',False):self.sounds.play('enabled')
+            except (RuntimeError,OSError):pass
+        if self.zone_clear_job is not None:
+            try:self.root.after_cancel(self.zone_clear_job)
+            except Exception:pass
+            self.zone_clear_job=None
+        if state=='paused':
+            label,caption=self.ZONE_TEXT.get(kind,self.ZONE_TEXT['extraction'])
+            self.zone_view=dict(kind=kind,label=label,caption=caption,color='#BB9B5D',avatar='pause');beep()
+        elif state=='standby':
+            self.zone_view=dict(kind='standby',label='撤离完成 · 等待新一局',caption='每 5 秒检测一次 · 看到战斗 HUD 自动开启',color='#6B9BD1',avatar='sleep')
+        elif state=='restart':
+            self.zone_view=dict(kind='restart',label='游戏已退出 · 等待重新启动',caption='重新进入战局后自动检测 HUD · '+self.key_name+' 可停止',color='#6B9BD1',avatar='sleep')
+        elif state=='raid':
+            self.zone_view=dict(kind='raid',label='新一局已识别',caption='已恢复正常监控',color='#6DAE8A',avatar='wake');beep('enabled')
+            token=self.token
+            def clear():
+                self.zone_clear_job=None
+                if self.token==token and self.zone_view is not None and self.zone_view.get('kind')=='raid':
+                    self.zone_view=None;self.status.set('监控中 · 已恢复正常监控');self.bottom_status.set('已开启 · '+self.key_name+' 可关闭');self.state_head.set('监控中')
+            self.zone_clear_job=self.root.after(3000,clear)
+        elif state=='left':
+            self.zone_view=None;beep()
+            self.status.set('监控中 · 已离开撤离区域，恢复判断');self.bottom_status.set('已开启 · '+self.key_name+' 可关闭');self.state_head.set('监控中')
+            return
+        view=self.zone_view
+        self.status.set(view['caption']);self.bottom_status.set(view['caption']);self.state_head.set(view['label'])
+
+    def position_feedback(self,payload):
+        """Lighthouse zone status on the UI thread: one short beep on each enter/leave edge."""
+        if payload.get('unavailable'):
+            self.zone_state=(self.token,None)
+            self.prep_feedback.set('灯塔定位不可用 · '+payload.get('reason','请查看日志'));return
+        protected=bool(payload.get('protected'))
+        previous=getattr(self,'zone_state',(None,None))
+        # The first report of a round only records the state; no beep.
+        changed=previous[0]==self.token and previous[1] is not None and previous[1]!=protected
+        self.zone_state=(self.token,protected)
+        if changed:
+            try:self.sounds.play_cue('enabled.wav')
+            except (RuntimeError,OSError):pass
+            self.event('lighthouse_zone_cue',protected=protected,distance=payload.get('distance'),position=payload.get('position'))
+        view=getattr(self,'zone_view',None)
+        if protected:
+            message='离开商人区域自动恢复 · 候选断网已暂停'
+            if payload.get('stale') or payload.get('failures',0)>=3:message+=' · 定位待恢复'
+            if view is None or view.get('kind')=='lighthouse':
+                self.zone_view=dict(kind='lighthouse',label=self.ZONE_TEXT['lighthouse'][0],caption=message,color='#BB9B5D',avatar='pause')
+            self.status.set(message);self.bottom_status.set(message);self.state_head.set(self.ZONE_TEXT['lighthouse'][0])
+        elif payload.get('map')=='Lighthouse':
+            if view is not None and view.get('kind')=='lighthouse':self.zone_view=None
+            if payload.get('failures',0)>=3:message='监控中 · 灯塔定位暂停，请检查截图键或目录'
+            elif changed or self.status.get()==self.ZONE_LEFT:message=self.ZONE_LEFT  # keep until the next edge
+            else:message='监控中 · 灯塔坐标按距离自动调整截图间隔'
+            self.status.set(message);self.bottom_status.set(message);self.state_head.set('监控中')
+
+    def check_screenshot_key(self,force=False):
+        """While idle, re-read the game's screenshot binding every 5 s and keep a hint up while it conflicts."""
+        now=time.perf_counter()
+        if not force and (now<getattr(self,'next_key_check',0.) or self.active or self.arming):return
+        self.next_key_check=now+5.
+        try:preferences=load_settings(self.config_path)
+        except (OSError,AttributeError):preferences={}
+        hint=''
+        if preferences.get('lighthouse_position_enabled',True) is True:
+            try:result=analyze_screenshot_binding(preferences,tool_combo=getattr(self.hotkey_service,'combo',None))
+            except Exception as exc:result=dict(hint='截图键检测失败：'+type(exc).__name__,usable=False,label='',problems=[])
+            hint=result['hint']
+            if hint!=self.screenshot_hint.get():
+                self.event('lighthouse_key_check',usable=result['usable'],key=result.get('label'),problems=result.get('problems'),warnings=result.get('warnings'))
+        if hint!=self.screenshot_hint.get():self.screenshot_hint.set(hint)
+
     def transfer_feedback(self,payload):
-        if payload.get('token')!=self.token or not self.active:return
+        if payload.get('token')!=self.token or not self.active or self.zone_view is not None:return
         phase=payload.get('phase','idle');resumed=payload.get('resumed',False)
         captions={'confirm':'转移中 · 确认倒计时，死亡检测继续', 'transfer_menu':'转移中 · 已识别传递物品界面，死亡检测继续',
                   'countdown':'转移中 · 等待转移倒计时与加载，保持监控',
@@ -1630,6 +1985,7 @@ class App:
 
     def close(self):
         self.cancel('程序退出');self.closed=True
+        if getattr(self,'position_session',None):self.position_session.close()
         # Stop the producer independently of an in-flight slow image analysis.
         if getattr(self,'parallel_session',None):self.parallel_session.close()
         if getattr(self,'capture_session',None):

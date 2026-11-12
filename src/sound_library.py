@@ -120,11 +120,20 @@ class SoundLibrary:
 
     def play(self,key):
         """A private playback device; gain changes affect this clip, never system audio."""
-        import miniaudio
-        import numpy as np
         path=self.resolve(key)
         if path is None or self.muted:return False
         choice=self.selected[key]
+        return self._play_path(path,lambda:self.volume(choice)/100.)
+
+    def play_cue(self,name='enabled.wav'):
+        """Fixed built-in cue (e.g. zone enter/leave). Ignores custom choices; respects mute."""
+        path=self.assets/name
+        if self.muted or not path.is_file():return False
+        return self._play_path(path,lambda:1.)
+
+    def _play_path(self,path,gain):
+        import miniaudio
+        import numpy as np
         self.stop()
         source=miniaudio.stream_file(str(path),nchannels=1,sample_rate=44100,frames_to_read=1024)
         def samples():
@@ -133,7 +142,7 @@ class SoundLibrary:
                 while True:
                     raw=source.send(needed)
                     pcm=np.frombuffer(raw,dtype=np.int16)
-                    needed=yield (pcm.astype(np.float32)*(self.volume(choice)/100.)).astype(np.int16).tobytes()
+                    needed=yield (pcm.astype(np.float32)*gain()).astype(np.int16).tobytes()
             except StopIteration:return
             finally:source.close()
         generator=samples();next(generator)
