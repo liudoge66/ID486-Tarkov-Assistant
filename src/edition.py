@@ -1,4 +1,4 @@
-"""Unified V0.3 product capabilities. Live monitoring and networking; no video replay."""
+"""Unified V0.3x product capabilities. Live monitoring and networking; no video replay."""
 try:
     from build_profile import EDITION
 except ImportError:
@@ -7,5 +7,5 @@ if EDITION not in ('', 'PMC', 'Fence'):
     raise ValueError('Unknown edition')
 FENCE = EDITION != 'PMC'
 NETWORK = True
-VERSION = 'V0.3'
-BUILD = '2026.11.12-v0.3-dxcam-lifetime-65'
+VERSION = 'V0.31'
+BUILD = '2026.11.21-v0.31-release-70'

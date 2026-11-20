@@ -12,7 +12,9 @@ class UniformFadeWatch:
         if context!=self.context or use_world!=self.world_context:
             self.reset();self.context=context;self.world_context=use_world
         gray=cv2.cvtColor(top[:,:,:3],cv2.COLOR_BGR2GRAY)
+        # inventory: tab row below the top-left overlay band (FPS/CPU text updates every frame) and the Return label.
         boxes=([(800,2,1160,65),(480,65,1030,125),(1680,2,1900,110)] if context=='settings' else [(360,65,760,235),(760,65,1160,235),(1160,65,1560,235)] if context=='esc'
+               else [(20,16,280,44),(280,16,760,44),(1720,2,1860,44)] if context=='inventory'
                else [(565,1,1020,80),(1020,1,1340,80),(200,110,1500,230)])
         patches=[cv2.resize(gray[y:y2,x:x2],(100,32)).astype('float32') for x,y,x2,y2 in boxes]
         if use_world:

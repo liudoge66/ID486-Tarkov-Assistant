@@ -99,4 +99,53 @@ class ZonePauseTests(unittest.TestCase):
         r=step(e,.5);self.assertIsNone(e.zone);self.assertEqual(r['action'],'monitor')
 
 
+def done_event(results):
+    for r in results:
+        for x in r['events']:
+            if x['event']=='zone_done':return x
+    return None
+
+
+class ZoneEndingLabelTests(unittest.TestCase):
+    """Display-only: HUD gone at the countdown's zero = finished; earlier = unconfirmed (e.g. died in the zone)."""
+    def countdown(self,e,start,stop,kind='extraction'):
+        t=0.;v=start
+        while v>=stop-1e-9:
+            if kind=='extraction':step(e,t,extraction=cue(round(v,1)))
+            else:step(e,t,transfer=dict(countdown=True,kind='countdown',value=round(v,1),badge_observed=True))
+            t=round(t+.3,3);v=round(v-.3,3)
+        return t
+
+    def finish(self,e,t,gap=.3):
+        results=[step(e,round(t+gap+.1*i,3),GONE) for i in range(4)]
+        self.assertNotIn('death',[r['action'] for r in results])
+        done=done_event(results);self.assertIsNotNone(done);return done,[r for r in results if r['action']=='zone_done'][0]
+
+    def test_extraction_countdown_reaches_zero_is_confirmed(self):
+        e=engine();t=self.countdown(e,7.,0.)
+        done,result=self.finish(e,t,gap=.9)          # real logs: HUD vanishes ~1.2 s after the last reading
+        self.assertTrue(done['confirmed']);self.assertTrue(result['confirmed']);self.assertLessEqual(done['remaining_s'],0.)
+
+    def test_hud_gone_mid_countdown_is_unconfirmed(self):
+        e=engine();t=self.countdown(e,7.,3.)
+        done,result=self.finish(e,t)
+        self.assertFalse(done['confirmed']);self.assertFalse(result['confirmed']);self.assertGreater(done['remaining_s'],2.)
+
+    def test_just_over_margin_is_unconfirmed(self):
+        e=engine();t=self.countdown(e,7.,1.6)
+        done,_=self.finish(e,t,gap=.1)
+        self.assertFalse(done['confirmed'])
+
+    def test_transfer_countdown_end_and_mid(self):
+        e=engine();t=self.countdown(e,19.,.1,kind='transfer')
+        done,_=self.finish(e,t,gap=.9);self.assertEqual(done['zone'],'transfer');self.assertTrue(done['confirmed'])
+        e=engine();t=self.countdown(e,19.,12.,kind='transfer')
+        done,_=self.finish(e,t);self.assertFalse(done['confirmed'])
+
+    def test_limbo_is_unconfirmed(self):
+        e=engine();t=self.countdown(e,7.,0.);half=dict(combat_score=.32,body_shape=.07,bar_frames=.40,label_shape=.42)
+        results=[step(e,t+1.4+.25*i,half) for i in range(60)]
+        done=done_event(results);self.assertEqual(done['reason'],'unresolved');self.assertFalse(done['confirmed'])
+
+
 if __name__=='__main__':unittest.main()

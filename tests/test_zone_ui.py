@@ -46,6 +46,25 @@ class ZoneUiTests(unittest.TestCase):
         ms,clear=app.jobs[-1];self.assertEqual(ms,3000);clear()
         self.assertIsNone(app.zone_view);self.assertEqual(app.state_head.get(),'监控中')
 
+    def test_unconfirmed_standby_keeps_color_and_avatar(self):
+        app=make_app()
+        app.zone_feedback(dict(state='standby',confirmed=False))
+        self.assertEqual(app.state_head.get(),'未确认撤离 · 等待新一局')
+        self.assertEqual((app.zone_view['color'],app.zone_view['avatar']),('#6B9BD1','sleep'))
+        self.assertEqual((app.beeps,app.plays),([],[]))
+        app.zone_feedback(dict(state='standby',confirmed=True))
+        self.assertEqual(app.state_head.get(),'撤离完成 · 等待新一局')
+
+    def test_restart_standby_says_game_started(self):
+        app=make_app()
+        app.zone_feedback(dict(state='restart'))
+        self.assertEqual(app.state_head.get(),'游戏已退出 · 等待重新启动')
+        app.zone_feedback(dict(state='standby',cue=True,restart=True))
+        self.assertEqual(app.state_head.get(),'游戏已启动 · 等待进入战局')
+        self.assertEqual((app.zone_view['color'],app.zone_view['avatar']),('#6B9BD1','sleep'))
+        app.zone_feedback(dict(state='standby',cue=True,restart=False))
+        self.assertEqual(app.state_head.get(),'撤离完成 · 等待新一局')
+
     def test_muted_means_no_sound_anywhere(self):
         app=make_app();app.sounds.muted=True
         app.sounds.play_cue=lambda name='enabled.wav':None if app.sounds.muted else app.beeps.append(name)

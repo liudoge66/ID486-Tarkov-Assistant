@@ -38,7 +38,7 @@ class SettlementWatch:
         if not candidates:raise OSError('当前游戏会话日志尚未找到，继续使用画面判断')
         self.folder=min(candidates,key=lambda item:item[0])[1]
         self._scan(initial=True)
-        self.event('settlement_watch_started',pid=self.pid,session=self.folder.name,
+        self.event('settlement_watch_started',pid=self.pid,session=self.folder.name,folder=str(self.folder),
                    files=[p.name for p in self.paths],skip_existing=True,route='/client/match/local/end')
 
     def _scan(self, initial=False):

@@ -1058,16 +1058,8 @@ class App:
                         self.zone_hold=True
                         if restarting:self.event('zone_restart_rebound',pid=info[1],creation_unix=exit_target.creation_unix)
                         self.event('zone_standby_started',reason='game_restarted' if restarting else 'armed_without_hud',menu_score=menu_score)
-                        self.ui.put(('zone_status',dict(token=token,state='standby',cue=True)))
+                        self.ui.put(('zone_status',dict(token=token,state='standby',cue=True,restart=restarting)))
                     else:self.ui.put(('status','监控中 · '+('只记录，不退出' if dry else '战斗 HUD 和菜单均消失并超过设定延时才退出')))
-                if getattr(exit_target,'creation_unix',None) is not None:
-                    try:
-                        settlement_watch=SettlementWatch(exit_target.executable.parent/'Logs',exit_target.creation_unix,info[1],self.event,
-                            on_request=lambda hint:self.position_end_request(token,hint))
-                        settlement_watch.start()
-                    except (OSError,ValueError) as exc:self.event('settlement_watch_error',pid=info[1],error_type=type(exc).__name__)
-                if getattr(exit_target,'creation_unix',None) is not None:
-                    position_watch=self.start_position_session(token,info,exit_target,settlement_watch.folder if settlement_watch else None,paused=standby)
                 last_new=time.perf_counter();last_ui=0;paused=False;capture_waiting=False;settings_transition=False;next_tick=last_new
                 standby_hit=None;standby_next=0.;standby_seq=-1
                 settlement_probe_id=None
@@ -1088,19 +1080,34 @@ class App:
                 self.hud_continuity=continuity
                 top_height=capture_strip_height(info[2],info[3])
                 expanded_height=min(info[3],max(top_height,round(info[3]*.47)))
-                if settlement_watch:
-                    parallel_target=GameProcess(info[1])
-                    def parallel_owner():
-                        return (token==self.token and self.active and not self.closed and not steam_paused and foreground_owner(info)
-                            and target()==info and not self.position_guard_active(token) and not bool(U.GetAsyncKeyState(0x1B)&0x8000)
-                            and geometry_signature(info)==last_geometry)
-                    parallel_check=ParallelSettlementCheck(camera,settlement_watch,FastProbe(),parallel_owner,
-                        lambda packet,fast_camera=camera:self.parallel_death(token,info,engine,parallel_target,fast_camera,packet),self.parallel_report)
-                    context=engine.settlement_context();context.update(active=True,observed_at=camera.capture_time,
-                        last_combat=camera.capture_time,guard_epoch=camera.delivered.guard_epoch,
-                        layout=dict(self.detector.layout),full_region=(0,0,info[2],info[3]))
-                    parallel_check.publish(context);parallel_check.start()
-                    self.parallel_session=parallel_check
+                def parallel_owner():
+                    return (token==self.token and self.active and not self.closed and not steam_paused and foreground_owner(info)
+                        and target()==info and not self.position_guard_active(token) and not bool(U.GetAsyncKeyState(0x1B)&0x8000)
+                        and geometry_signature(info)==last_geometry)
+                def start_log_helpers():
+                    # Settlement-log and Lighthouse helpers need this game's session log and a locked HUD layout.
+                    # Each part starts once; calling again is a no-op.
+                    nonlocal settlement_watch,position_watch,parallel_check,parallel_target
+                    if getattr(exit_target,'creation_unix',None) is None:return
+                    if settlement_watch is None:
+                        try:
+                            settlement_watch=SettlementWatch(exit_target.executable.parent/'Logs',exit_target.creation_unix,info[1],self.event,
+                                on_request=lambda hint:self.position_end_request(token,hint))
+                            settlement_watch.start()
+                        except (OSError,ValueError) as exc:self.event('settlement_watch_error',pid=info[1],error_type=type(exc).__name__)
+                    if position_watch is None:
+                        position_watch=self.start_position_session(token,info,exit_target,settlement_watch.folder if settlement_watch else None,paused=standby)
+                    if settlement_watch and parallel_check is None:
+                        parallel_target=GameProcess(info[1])
+                        parallel_check=ParallelSettlementCheck(camera,settlement_watch,FastProbe(),parallel_owner,
+                            lambda packet,fast_camera=camera:self.parallel_death(token,info,engine,parallel_target,fast_camera,packet),self.parallel_report)
+                        context=engine.settlement_context();context.update(active=True,observed_at=camera.capture_time,
+                            last_combat=camera.capture_time,guard_epoch=camera.delivered.guard_epoch,
+                            layout=dict(self.detector.layout or self.detector.layout_info or {}),full_region=(0,0,info[2],info[3]))
+                        parallel_check.publish(context);parallel_check.start()
+                        self.parallel_session=parallel_check
+                if standby:self.event('zone_log_helpers_deferred',pid=info[1],reason='game_restarted' if restarting else 'armed_without_hud')
+                else:start_log_helpers()
                 def collect(phase,stamp):
                     if diagnostic and self.collect_enabled and hasattr(self.detector,'last_top'):
                         evidence_frame=frame if FENCE and frame is not None and frame.shape[:2]==(info[3],info[2]) else self.detector.last_top
@@ -1122,7 +1129,9 @@ class App:
                             absence_ms_before_decision=0 if self.gate.missing_since is None else (stamp-self.gate.missing_since)*1000))
                 next_scope_check=0.
                 while True:
-                    if standby and exit_target.handle and K.WaitForSingleObject(exit_target.handle,0)==0:
+                    if (standby or paused) and exit_target.handle and K.WaitForSingleObject(exit_target.handle,0)==0:
+                        # Game closed (e.g. Alt+F4) while paused: release this binding and wait for a new process.
+                        if paused and not standby:self.event('zone_game_exited',pid=info[1])
                         self.queue_game_restart(token,info,dry)
                         break
                     if time.perf_counter()>=next_scope_check:
@@ -1221,13 +1230,16 @@ class App:
                                 resumed=engine.standby_resume(standby_scores,standby_features)
                                 if resumed:
                                     standby=False;self.zone_hold=False
+                                    if hasattr(self.detector,'lock_current_layout'):self.detector.lock_current_layout()
+                                    deferred=settlement_watch is None and position_watch is None
+                                    start_log_helpers()
+                                    if deferred:self.event('zone_log_helpers_started',pid=info[1],settlement=bool(settlement_watch),position=bool(position_watch))
                                     if position_watch:
                                         position_watch.set_paused(False)
                                         position_watch.confirm_hud(standby_stamp)
                                     if restarting:
                                         self.start_network_session(token,info)
                                         restarting=False
-                                    if hasattr(self.detector,'lock_current_layout'):self.detector.lock_current_layout()
                             if not resumed:
                                 standby_hit=None;continue
                             standby_hit=None;extraction_trace.clear();isolation_candidate.reset();camera.invalidate()
@@ -1557,7 +1569,7 @@ class App:
                             camera.invalidate()
                             if parallel_check:parallel_check.publish(dict(active=False))
                             if self.network:self.network.scene(settled=True,monitor_token=token)
-                            self.ui.put(('zone_status',dict(token=token,state='standby')))
+                            self.ui.put(('zone_status',dict(token=token,state='standby',confirmed=outcome.get('confirmed',True))))
                         collect(outcome['action'],now)
                         analysis_ms.append((time.perf_counter()-begin)*1000)
                         if now-window_start>=5:performance()
@@ -1894,7 +1906,9 @@ class App:
             label,caption=self.ZONE_TEXT.get(kind,self.ZONE_TEXT['extraction'])
             self.zone_view=dict(kind=kind,label=label,caption=caption,color='#BB9B5D',avatar='pause');beep()
         elif state=='standby':
-            self.zone_view=dict(kind='standby',label='撤离完成 · 等待新一局',caption='每 5 秒检测一次 · 看到战斗 HUD 自动开启',color='#6B9BD1',avatar='sleep')
+            label=('游戏已启动 · 等待进入战局' if payload.get('restart') else
+                   '撤离完成 · 等待新一局' if payload.get('confirmed',True) else '未确认撤离 · 等待新一局')
+            self.zone_view=dict(kind='standby',label=label,caption='每 5 秒检测一次 · 看到战斗 HUD 自动开启',color='#6B9BD1',avatar='sleep')
         elif state=='restart':
             self.zone_view=dict(kind='restart',label='游戏已退出 · 等待重新启动',caption='重新进入战局后自动检测 HUD · '+self.key_name+' 可停止',color='#6B9BD1',avatar='sleep')
         elif state=='raid':

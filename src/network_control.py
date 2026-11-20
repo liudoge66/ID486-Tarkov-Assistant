@@ -355,7 +355,8 @@ class NetworkController:
             if self.death and action in ('isolate','restore','prepare'):return
             item=dict(id=uuid.uuid4().hex,action=action,created=datetime.now(timezone.utc).isoformat(),**details)
             filename='urgent_command' if action in ('death_cutoff','end_hold') else 'command'
-            temporary=self.folder/(filename+'.tmp');temporary.write_text(json.dumps(item),encoding='utf-8');os.replace(temporary,self.folder/(filename+'.json'));self.notify_broker()
+            temporary=self.folder/(filename+'.tmp');temporary.write_text(json.dumps(item),encoding='utf-8')
+            self.replace_command(temporary,self.folder/(filename+'.json'),action);self.notify_broker()
             self.pending=item['id'];self.pending_when=time.monotonic()
             self.event('network_command',action=action,command_id=item['id'],pid=self.pid,request_revision=self.running_revision,
                 requested_revision=self.request_revision,
@@ -363,6 +364,24 @@ class NetworkController:
                 scope=details.get('scope'),diagnostic=details.get('diagnostic'),
                 meaning='written_to_broker_not_proof_of_packet_blocking')
             return item['id']
+
+    def replace_command(self,temporary,target,action,budget=.25):
+        # The broker re-reads command.json every loop; while its read handle is open
+        # Windows denies the rename (WinError 5). Retry briefly instead of stopping protection.
+        start=time.monotonic();attempts=0
+        while True:
+            try:os.replace(temporary,target)
+            except PermissionError as exc:
+                attempts+=1
+                if time.monotonic()-start>=budget:
+                    self.event('network_command_retry',action=action,attempts=attempts,gave_up=True,reason=str(exc),
+                               elapsed_ms=round((time.monotonic()-start)*1000,3))
+                    raise
+                time.sleep(.005);continue
+            if attempts:
+                self.event('network_command_retry',action=action,attempts=attempts,gave_up=False,
+                           elapsed_ms=round((time.monotonic()-start)*1000,3))
+            return
 
     def start_broker(self):
         helper=self.assets/'network'/'ID486NetworkBroker.exe'

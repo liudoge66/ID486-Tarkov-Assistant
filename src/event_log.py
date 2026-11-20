@@ -36,7 +36,7 @@ NAMES = {
     'extraction_candidate_cancelled':'撤离候选已撤销（继续监控）',
     'extraction_latch_unresolved':'撤离过程未能确认（已停止监控，未退出）',
     'zone_entered':'已进入撤离/转移区域，自动暂停', 'zone_left':'已离开撤离/转移区域，恢复监控',
-    'zone_done':'撤离/转移完成，进入低频等待', 'zone_standby_started':'低频等待已开始',
+    'zone_done':'撤离/转移自动暂停结束，进入低频等待', 'network_command_retry':'联网命令写入被占用，已重试','round_summary':'本局结束汇总','round_summary_error':'本局汇总生成失败（不影响判断）','zone_log_helpers_deferred':'等待新一局：结算日志与灯塔辅助在识别到战斗HUD后启动','zone_log_helpers_started':'已识别战斗HUD，结算日志与灯塔辅助已启动','zone_game_exited':'暂停判断期间游戏进程已退出，等待重新启动', 'zone_standby_started':'低频等待已开始',
     'zone_standby_resumed':'已识别新一局战斗HUD，恢复正常监控', 'zone_auto_pause_changed':'监控自动暂停开关已更改',
     'full_review_frame_retained':'已有完整画面，继续本帧复核而不整轮重采',
     'game_end_request_summary':'本轮游戏结束请求观察汇总',
@@ -142,6 +142,41 @@ class EventJournal:
     def __init__(self, stream, fence, jsonl_stream=None):
         self.stream=stream;self.fence=fence;self.jsonl_stream=jsonl_stream;self.lock=threading.Lock();self.sequence=0
         self.session=uuid.uuid4().hex;self.wall=time.time_ns();self.mono=time.perf_counter_ns()
+        # Per-raid summary (observation only). Sees every event, including ones not printed below.
+        from round_summary import RoundSummary
+        self.rounds=RoundSummary(self.wall,self.mono);self.round_timer=None;self.round_lock=threading.Lock()
+
+    def write(self, kind, details, detailed=False):
+        finished=[]
+        if kind!='round_summary':
+            try:finished=self.rounds.observe(kind,details,time.time_ns())
+            except Exception as exc:finished=[];self._write(kind='round_summary_error',details=dict(reason=repr(exc),source_event=kind),detailed=detailed)
+        self._write(kind,details,detailed)
+        for summary in finished:self._write('round_summary',summary,detailed)
+        if kind!='round_summary':self._arm_round_timer()
+
+    def _arm_round_timer(self):
+        deadline=self.rounds.pending_deadline()
+        with self.round_lock:
+            if self.round_timer is not None:self.round_timer.cancel();self.round_timer=None
+            if deadline is None:return
+            self.round_timer=threading.Timer(max(0.,(deadline-time.time_ns())/1e9)+.01,self._round_due)
+            self.round_timer.daemon=True;self.round_timer.start()
+
+    def _round_due(self):
+        try:summary=self.rounds.due()
+        except Exception as exc:
+            self._write('round_summary_error',dict(reason=repr(exc),source_event='timer'));return
+        if summary is not None:self._write('round_summary',summary)
+        self._arm_round_timer()
+
+    def flush_round(self):
+        """App exit: write a pending summary now instead of waiting for its timer."""
+        with self.round_lock:
+            if self.round_timer is not None:self.round_timer.cancel();self.round_timer=None
+        try:summary=self.rounds.due(now_ns=1<<62)
+        except Exception:summary=None
+        if summary is not None:self._write('round_summary',summary)
 
     def _format_jsonl(self, kind, name, details, wall, mono):
         record=dict(schema_version=2,session_id=self.session,sequence=self.sequence,
@@ -154,7 +189,7 @@ class EventJournal:
             elif key.endswith('_wall_ns') and isinstance(value,int):record[key+'_time']=stamp(value)
         return json.dumps(record,ensure_ascii=False,default=str)+'\n'
 
-    def write(self, kind, details, detailed=False):
+    def _write(self, kind, details, detailed=False):
         if kind.startswith(('lighthouse_','zone_')):PMC_EVENTS.add(kind)
         if kind.startswith('transfer_'):PMC_EVENTS.add(kind)
         if not self.fence and kind not in PMC_EVENTS and not (detailed and kind in ('performance','focus_paused','focus_resumed','capture_stalled','game_window_hidden','game_window_gone')):return
@@ -167,6 +202,8 @@ class EventJournal:
                 except OSError:pass
             if self.fence:
                 self.stream.write(self._format_jsonl(kind,name,details,wall,mono))
+            elif kind=='round_summary':
+                self.stream.write('['+stamp(wall)+'] '+name+'\n'+''.join('    '+line+'\n' for line in details.get('text',[])))
             else:
                 important=[]
                 if kind.startswith('lighthouse_'):
@@ -245,6 +282,6 @@ class EventJournal:
                 for original,translated in states.items():text=text.replace('检查结果：'+original,'检查结果：'+translated)
                 self.stream.write('['+stamp(wall)+'] '+name+('｜'+text if text else '')+'\n')
 
-PMC_EVENTS.update(('network_pulse_retry','network_auto_recover_scheduled','network_auto_recover_start'))
+PMC_EVENTS.update(('round_summary','round_summary_error','network_pulse_retry','network_command_retry','network_auto_recover_scheduled','network_auto_recover_start'))
 
 PMC_EVENTS.add('center_extraction_countdown')
