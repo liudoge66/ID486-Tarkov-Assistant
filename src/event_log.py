@@ -285,3 +285,7 @@ class EventJournal:
 PMC_EVENTS.update(('round_summary','round_summary_error','network_pulse_retry','network_command_retry','network_auto_recover_scheduled','network_auto_recover_start'))
 
 PMC_EVENTS.add('center_extraction_countdown')
+
+NAMES.update({'raid_log_state':'游戏日志战局状态变化','raid_log_blocked_arm':'游戏日志显示未进入战局，未开启监控',
+              'raid_log_blocked_resume':'游戏日志显示未进入战局，继续低频等待'})
+PMC_EVENTS.update(('raid_log_state','raid_log_blocked_arm','raid_log_blocked_resume'))

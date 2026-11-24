@@ -14,7 +14,7 @@ from tkinter import ttk, filedialog
 from tkinterdnd2 import TkinterDnD, DND_FILES
 from sound_library import SoundLibrary
 from app_storage import load_settings, writable_data_directory
-from raid_scope import game_rejection, TITLE as ONLINE_TITLE, CAPTION as ONLINE_CAPTION
+from raid_scope import game_rejection, game_lifecycle, TITLE as ONLINE_TITLE, CAPTION as ONLINE_CAPTION
 from lighthouse_position import LocationMonitor,ScreenshotRetention,bind_session,default_screenshot_roots
 from game_keys import analyze as analyze_screenshot_binding
 from primary_ui import PrimaryUI
@@ -1036,14 +1036,22 @@ class App:
                 blocked=game_rejection(exit_target)
                 if blocked:
                     self.reject_raid_scope(token,blocked);continue
+                # A HUD-like frame is only a raid if this game's own log agrees ('unknown' keeps
+                # the visual-only behaviour). Fixes video frames being taken as a raid HUD.
+                arm_lifecycle=game_lifecycle(exit_target)
+                log_blocked=confirmed and arm_lifecycle in ('menu','loading')
+                if log_blocked:self.event('raid_log_blocked_arm',pid=info[1],state=arm_lifecycle,features=self.detector.last_features)
                 with self.lock:
                     if token!=self.token or self.closed:continue
                     self.arming=False
-                    armed_ok=bool(confirmed and target()==info and self.gate.arm(scores,menu_present=menu_score>=.55,combat_score=self.detector.last_features["combat_score"],features=self.detector.last_features))
+                    armed_ok=bool(confirmed and not log_blocked and target()==info and self.gate.arm(scores,menu_present=menu_score>=.55,combat_score=self.detector.last_features["combat_score"],features=self.detector.last_features))
                     standby=bool(not armed_ok and (self.zone_allowed or restarting) and target()==info)
                     if not armed_ok and not standby:
                         if restarting:
                             self.arming=True;self.pending.put((token,None,dry,True));continue
+                        if log_blocked:
+                            self.event('arm_rejected',reason='游戏日志显示尚未进入战局',raid_log=arm_lifecycle,arm_policy=confirmation.summary(),scores=scores,menu_score=menu_score)
+                            self.cancel('游戏日志显示还没进入战局，请进入战局后再开启');continue
                         self.event('arm_rejected',reason='首次开启需要战斗HUD，菜单不能单独开启',arm_policy=confirmation.summary(),scores=scores,menu_score=menu_score,
                             frame_size=list(frame.shape[:2]) if frame is not None else None,expected_size=list(shape),features=self.detector.last_features,menu_features=self.detector.last_menu_features,extraction_cues=getattr(self.detector,'last_extraction',{}))
                         self.cancel('未观察到战斗HUD，请在血量人形与快捷栏可见时开启');continue
@@ -1127,7 +1135,7 @@ class App:
                             delay_ms=self.gate.delay_ms,capture_hz=hz,full_size=[info[2],info[3]],
                             esc_capture_expanded=esc_expanded,capture_region=list(region),capture_source=camera.delivered.provenance,
                             absence_ms_before_decision=0 if self.gate.missing_since is None else (stamp-self.gate.missing_since)*1000))
-                next_scope_check=0.
+                next_scope_check=0.;raid_log=arm_lifecycle
                 while True:
                     if (standby or paused) and exit_target.handle and K.WaitForSingleObject(exit_target.handle,0)==0:
                         # Game closed (e.g. Alt+F4) while paused: release this binding and wait for a new process.
@@ -1139,6 +1147,24 @@ class App:
                         blocked=game_rejection(exit_target)
                         if blocked:
                             self.reject_raid_scope(token,blocked);break
+                        state=game_lifecycle(exit_target)
+                        if state!=raid_log:
+                            self.event('raid_log_state',pid=info[1],state=state,previous=raid_log,standby=standby)
+                            raid_log=state
+                        if state=='menu' and not standby:
+                            # The game log says this raid is over and the game is back at the menu:
+                            # stop the death lane and wait for the next raid instead of judging frames.
+                            with self.lock:
+                                if not self.active or token!=self.token or self.closed:break
+                                self.gate.cancel();engine.pause();self.zone_hold=True
+                            isolation_candidate.reset();extraction_trace.clear()
+                            standby=True;standby_hit=None;standby_next=time.perf_counter()+ZONE_STANDBY_INTERVAL
+                            if position_watch:position_watch.set_paused(True)
+                            camera.invalidate()
+                            if parallel_check:parallel_check.publish(dict(active=False))
+                            if self.network:self.network.scene(settled=True,monitor_token=token)
+                            self.event('zone_standby_started',reason='raid_log_menu',menu_score=None)
+                            self.ui.put(('zone_status',dict(token=token,state='standby',cue=False,raid_log=True)))
                     with self.lock:
                         if not self.active or token!=self.token or self.closed:break
                         engine.zone_enabled=self.zone_allowed
@@ -1225,6 +1251,11 @@ class App:
                             blocked=game_rejection(exit_target)
                             if blocked:
                                 self.reject_raid_scope(token,blocked);break
+                            resume_log=game_lifecycle(exit_target)
+                            if resume_log in ('menu','loading'):
+                                # HUD-like frames while the log says no raid has started: keep waiting.
+                                self.event('raid_log_blocked_resume',pid=info[1],state=resume_log,features=standby_features)
+                                standby_hit=None;continue
                             with self.lock:
                                 if token!=self.token or not self.active or self.closed:break
                                 resumed=engine.standby_resume(standby_scores,standby_features)
@@ -1907,8 +1938,9 @@ class App:
             self.zone_view=dict(kind=kind,label=label,caption=caption,color='#BB9B5D',avatar='pause');beep()
         elif state=='standby':
             label=('游戏已启动 · 等待进入战局' if payload.get('restart') else
+                   '游戏日志显示已回到菜单 · 等待新一局' if payload.get('raid_log') else
                    '撤离完成 · 等待新一局' if payload.get('confirmed',True) else '未确认撤离 · 等待新一局')
-            self.zone_view=dict(kind='standby',label=label,caption='每 5 秒检测一次 · 看到战斗 HUD 自动开启',color='#6B9BD1',avatar='sleep')
+            self.zone_view=dict(kind='standby',label=label,caption='每 5 秒检测一次 · 游戏日志进入战局且看到战斗 HUD 后自动开启',color='#6B9BD1',avatar='sleep')
         elif state=='restart':
             self.zone_view=dict(kind='restart',label='游戏已退出 · 等待重新启动',caption='重新进入战局后自动检测 HUD · '+self.key_name+' 可停止',color='#6B9BD1',avatar='sleep')
         elif state=='raid':

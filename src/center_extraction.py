@@ -28,6 +28,23 @@ class CenterExtractionTimer:
         if not matched:result.update(value=None,reason='long_timer_needs_confirmation')
         return result
     def read_decimal(self,gray,scale):
+        value,confidence=self._read_decimal_once(gray,scale)
+        if value is not None or not gray.size:return value,confidence
+        # Global Otsu fails when the strip behind the digits mixes bright and dark
+        # scenery (11-22 Labs elevator: sleeve + glove behind "4.1"). Black-hat
+        # keeps only strokes darker than their neighbourhood. Accept a reading
+        # only if two kernel sizes agree (offline: 14/15 Labs frames, 19/19
+        # previously readable frames unchanged).
+        readings=[]
+        for k in (7,11):
+            size=max(3,round(k*scale))|1
+            hat=cv2.morphologyEx(gray,cv2.MORPH_BLACKHAT,cv2.getStructuringElement(cv2.MORPH_RECT,(size,size)))
+            if int(hat.max())<24:return None,0.
+            readings.append(self._read_decimal_once(255-cv2.normalize(hat,None,0,255,cv2.NORM_MINMAX),scale))
+        (a,ca),(b,cb)=readings
+        if a is None or a!=b:return None,0.
+        return a,min(ca,cb)
+    def _read_decimal_once(self,gray,scale):
         value,confidence=self.numbers.read_number(gray,scale)
         if value is not None:return value,confidence
         # At smaller resolutions, 8 and 6 can be close in template score.

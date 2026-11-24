@@ -8,4 +8,4 @@ if EDITION not in ('', 'PMC', 'Fence'):
 FENCE = EDITION != 'PMC'
 NETWORK = True
 VERSION = 'V0.31'
-BUILD = '2026.11.21-v0.31-release-70'
+BUILD = '2026.11.24-v0.31-raid-log-71'

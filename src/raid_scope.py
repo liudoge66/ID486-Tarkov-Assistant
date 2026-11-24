@@ -9,6 +9,21 @@ CAPTION='当前战局为 Online，仅支持本地 PvE'
 STAMP=re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})')
 ONLINE=re.compile(r'\bRaidMode\s*:\s*Online\b',re.I)
 
+# Raid lifecycle markers in application_*.log (checked 2026-11-24 over all
+# November sessions). GameStarted = player spawned in a raid. The menu markers
+# appear only after the raid's settlement screens or at launch; across 49 death
+# and extraction decisions, the latest marker before the decision was a menu
+# marker only in the 11-24 02:38 false trigger (game still at the login menu).
+LIFE_IN_RAID=re.compile(r'\|application\|GameStarted:')
+LIFE_LOADING=re.compile(r'\|application\|(?:MatchingCompleted|LocationLoaded:|GameStarting:|Matching with group id:|scene preset path:)')
+LIFE_MENU=re.compile(r'\|application\|(?:PrepareSelectedProfileLocally|CompleteSelectedProfile|Session mode:)')
+
+def lifecycle(line):
+    if LIFE_IN_RAID.search(line):return 'in_raid'
+    if LIFE_MENU.search(line):return 'menu'
+    if LIFE_LOADING.search(line):return 'loading'
+    return None
+
 def rejection(lines):
     current=None;online=False;scene_seen=False
     for line in lines:
@@ -32,6 +47,16 @@ class SessionReader:
         self.folder=Path(folder);self.files={}
 
     def poll(self):
+        return rejection(line for _,line in self._read())
+
+    def lifecycle(self):
+        """'in_raid', 'loading' or 'menu' from the newest lifecycle marker; 'menu' before any marker."""
+        state='menu'
+        for _,line in self._read():
+            state=lifecycle(line) or state
+        return state
+
+    def _read(self):
         paths=[]
         for path in self.folder.glob('*.log'):
             m=APPLICATION.search(path.name)
@@ -47,13 +72,13 @@ class SessionReader:
                     for raw_line in lines:
                         line=raw_line.decode('utf-8',errors='replace')
                         stamp=STAMP.match(line)
-                        if stamp and (map_event(line) or ONLINE.search(line)):
+                        if stamp and (map_event(line) or ONLINE.search(line) or lifecycle(line)):
                             rows.append((stamp[1],line))
                 offset=stream.tell()
             self.files[path]=(offset,pending,rows)
         rows=[row for _,_,entries in self.files.values() for row in entries]
         rows.sort(key=lambda row:row[0])
-        return rejection(line for _,line in rows)
+        return rows
 
 import threading
 _readers={}
@@ -75,3 +100,31 @@ def game_rejection(game):
         return session_rejection(folder)
     except OSError:
         return None
+
+
+_folders={}
+
+def game_lifecycle(game):
+    """Raid lifecycle of this game process from its own session log.
+
+    Returns 'in_raid', 'loading', 'menu', or 'unknown' when the session log
+    can't be found or read; callers keep the visual-only behaviour for 'unknown'.
+    """
+    started=getattr(game,'creation_unix',None)
+    if started is None:return 'unknown'
+    try:
+        key=(str(game.executable),float(started))
+        with _reader_lock:folder=_folders.get(key)
+        if folder is None:
+            folder=bind_session(game.executable.parent/'Logs',started,time.time())
+            with _reader_lock:
+                if len(_folders)>=4:_folders.pop(next(iter(_folders)))
+                _folders[key]=folder
+        with _reader_lock:
+            path=str(Path(folder).resolve())
+            if path not in _readers:
+                if len(_readers)>=4:_readers.pop(next(iter(_readers)))
+                _readers[path]=SessionReader(folder)
+            return _readers[path].lifecycle()
+    except (OSError,AttributeError,TypeError,ValueError):
+        return 'unknown'
