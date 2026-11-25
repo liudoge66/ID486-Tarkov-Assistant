@@ -7,5 +7,5 @@ if EDITION not in ('', 'PMC', 'Fence'):
     raise ValueError('Unknown edition')
 FENCE = EDITION != 'PMC'
 NETWORK = True
-VERSION = 'V0.31'
-BUILD = '2026.11.24-v0.31-raid-log-71'
+VERSION = 'V0.32'
+BUILD = '2026.11.25-v0.32-release-75'

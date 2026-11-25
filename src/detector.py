@@ -36,6 +36,14 @@ class ArmConfirmation:
         return dict(frames=self.frames,stable_ms=0,required_ms=0,min_frames=1,
                     requires='any: combat >= .48 OR body >= .45 OR bar frames >= .22 OR label edges >= .35')
 
+# Inventory cues (build 73). When the strict tab-text match fails, two of three independent cues are required:
+#   A tab text allowing shift (tolerant_tab_support >= .60), B tab boxes (one highlighted slot + dark slots),
+#   C Return label >= INVENTORY_RETURN_GATE. 2026-11-25 samples: 37 inventory frames all pass, 346 others none;
+#   others peak at A .56 / C .61, and B alone fired once (quick-slot bar while switching weapons, Return .04).
+INVENTORY_RETURN_GATE=.75   # was .85 in build 72; a red raid timer beside Return pulled it to .84 (03:15 false exit)
+INVENTORY_TOLERANT_MIN=.60
+TAB_SLOT0,TAB_PITCH,TAB_SLOTS=11,122,7   # 1920-wide coordinates of the 1.3.5 inventory tab slots
+
 class Detector:
     def __init__(self, asset_dir=None, *, parallel_ui=True):
         self.parallel_ui=parallel_ui;self.last_parallel=dict(used=False)
@@ -475,6 +483,16 @@ class Detector:
         # The right-hand Return label can disappear against bright scenery.
         # Navigation remains the required evidence; Return is only supporting.
         inventory=.90*inv_edge+.10*inv_return if inv_edge>=.60 else 0.
+        inv_tolerant=None;inv_boxes=None;inv_votes=0
+        if inventory==0.:
+            # EFT 1.3.5 (Unity 6): the tab row is sometimes drawn ~0.3% narrower (up to ~2 px off at its
+            # right end), and overlays such as the red raid timer can cover part of Return. No single cue
+            # decides: two of tab text (shift-tolerant), tab boxes and Return must agree.
+            inv_boxes=self.tab_boxes(gray)
+            return_ok=inv_return>=INVENTORY_RETURN_GATE
+            if return_ok or inv_boxes['present']:inv_tolerant=self.tolerant_tab_support(gray)
+            inv_votes=int(bool(inv_tolerant is not None and inv_tolerant>=INVENTORY_TOLERANT_MIN))+int(inv_boxes['present'])+int(return_ok)
+            if inv_votes>=2:inventory=max(.66,.90*(inv_tolerant or 0.)+.10*inv_return)
         settings_title=correlation((840,5,1010,65),self.extra_menu_templates['settings_title'])
         settings_return=self.distance_support(cv2.Canny(gray[25:78,1765:1845],35,90),self.settings_return_edges)
         settings=min(settings_title,settings_return)
@@ -485,7 +503,7 @@ class Detector:
         confirm_subtitle=correlation((905,58,1020,80),self.extra_menu_templates['confirm_subtitle'])
         confirmation=min(confirm_title,confirm_subtitle)
         self.last_menu_features=dict(inventory=inventory,settings=settings,pause=pause,confirmation=confirmation,
-            inventory_nav=inv_edge,inventory_return=inv_return,settings_title=settings_title,settings_return=settings_return,
+            inventory_nav=inv_edge,inventory_return=inv_return,inventory_nav_tolerant=inv_tolerant,inventory_boxes=inv_boxes,inventory_votes=inv_votes,settings_title=settings_title,settings_return=settings_return,
             pause_left=pause_left,pause_right=pause_right,confirm_title=confirm_title,confirm_subtitle=confirm_subtitle,skipped_for_combat=False,console_features=console)
         return max(inventory,settings,pause,confirmation)
 
@@ -528,6 +546,46 @@ class Detector:
         out=(body,.58*frames+.42*labels)
         self._last_scores_top=(top.copy(),dict(self.last_features),out)
         return out
+
+    @staticmethod
+    def tab_boxes(gray):
+        """Inventory tab row by its boxes, not its text: one highlighted slot (bright top edge, gradient below)
+        and at least four darker slots holding text, all on the 1.3.5 slot grid."""
+        top=gray[:48,:1100]
+        band=np.percentile(top[8:22],90,axis=0)
+        on=np.r_[band>205,False];runs=[];start=None
+        for x,v in enumerate(on):
+            if v and start is None:start=x
+            if not v and start is not None:runs.append((start,x-start));start=None
+        found=[]
+        for x,w in runs:
+            if not 120<=w<=165:continue
+            slot=(x-TAB_SLOT0)/TAB_PITCH
+            if abs(slot-round(slot))*TAB_PITCH>8 or not 0<=round(slot)<TAB_SLOTS:continue
+            if int((np.median(top[5:40,x+8:x+w-8],1)>120).sum())<20:continue
+            found.append((int(round(slot)),x,w))
+        if len(found)!=1:return dict(present=False,highlights=len(found),slot=None,others=0)
+        selected,x,w=found[0]
+        bright=float(np.median(top[5:40,x:x+w]));others=0
+        for k in range(TAB_SLOTS):
+            if k==selected:continue
+            x0=TAB_SLOT0+k*TAB_PITCH+6;cell=gray[8:37,x0:x0+w-12]
+            if cell.size and np.median(cell)<bright-60 and (cv2.Canny(cell,35,90)>0).mean()>.02:others+=1
+        return dict(present=others>=4,highlights=1,slot=selected,others=others)
+
+    def tolerant_tab_support(self,gray,shift=4,segments=6):
+        """Inventory tab-row support allowing +-shift px horizontally; the weakest of `segments` columns is ignored."""
+        reference=self.inventory_edges;width=reference.shape[1];step=width//segments;best=0.
+        for dx in range(-shift,shift+1):
+            x0=280+dx
+            if x0<0 or x0+width>gray.shape[1]:continue
+            distance=cv2.distanceTransform(255-cv2.Canny(gray[14:40,x0:x0+width],35,90),cv2.DIST_L2,3)
+            scores=[]
+            for x in range(0,step*segments,step):
+                values=distance[:,x:x+step][reference[:,x:x+step]>0]
+                if len(values):scores.append(float(np.mean(np.maximum(0,1-values/1.8))))
+            if len(scores)>=2:best=max(best,sum(sorted(scores)[1:])/(len(scores)-1))
+        return best
 
     @staticmethod
     def distance_support(edges,reference):

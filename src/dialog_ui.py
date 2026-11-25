@@ -24,6 +24,27 @@ def panel_font(root, scale):
     # Negative Tk sizes are pixels, keeping text aligned with the image-based panel.
     return tkfont.Font(root=root,family=family,size=-max(14,min(22,round(24*scale))))
 
+GOLDEN_LEFT=1-(5**.5-1)/2   # 0.382: the left golden-section line of the work area
+
+def place_on_golden_line(window):
+    """Centre the window's outer frame on the left golden-section line of its monitor's work
+    area (taskbar excluded), vertically centred, kept fully on screen."""
+    window.update_idletasks()
+    user=C.WinDLL('user32',use_last_error=True)
+    class MONITORINFO(C.Structure):
+        _fields_=[('cbSize',W.DWORD),('rcMonitor',W.RECT),('rcWork',W.RECT),('dwFlags',W.DWORD)]
+    user.GetAncestor.argtypes=[W.HWND,W.UINT];user.GetAncestor.restype=W.HWND
+    user.GetWindowRect.argtypes=[W.HWND,C.POINTER(W.RECT)];user.GetWindowRect.restype=W.BOOL
+    user.MonitorFromWindow.argtypes=[W.HWND,W.DWORD];user.MonitorFromWindow.restype=W.HANDLE
+    user.GetMonitorInfoW.argtypes=[W.HANDLE,C.POINTER(MONITORINFO)];user.GetMonitorInfoW.restype=W.BOOL
+    user.SetWindowPos.argtypes=[W.HWND,W.HWND,C.c_int,C.c_int,C.c_int,C.c_int,W.UINT]
+    hwnd=user.GetAncestor(window.winfo_id(),2);frame=W.RECT();info=MONITORINFO();info.cbSize=C.sizeof(MONITORINFO)
+    if not (user.GetWindowRect(hwnd,C.byref(frame)) and user.GetMonitorInfoW(user.MonitorFromWindow(hwnd,2),C.byref(info))):return
+    work=info.rcWork;w=frame.right-frame.left;h=frame.bottom-frame.top
+    x=round(work.left+(work.right-work.left)*GOLDEN_LEFT-w/2);y=round(work.top+(work.bottom-work.top-h)/2)
+    x=max(work.left,min(x,work.right-w));y=max(work.top,min(y,work.bottom-h))
+    user.SetWindowPos(hwnd,None,x,y,0,0,0x15)   # NOSIZE|NOZORDER|NOACTIVATE
+
 def center_dialog(window, parent):
     parent.update_idletasks();window.update_idletasks()
     width=window.winfo_reqwidth();height=window.winfo_reqheight()

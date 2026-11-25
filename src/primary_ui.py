@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import json,time,math,tkinter as tk
 import numpy as np
 from PIL import Image,ImageDraw,ImageFont,ImageTk,ImageChops,ImageColor
+from dialog_ui import place_on_golden_line
 
 def ease(t):
     t=max(0.,min(1.,t));return t*t*(3-2*t)
@@ -49,6 +50,8 @@ class PrimaryUI(VolumeControl,Dropdowns):
         for k,v in (('prep',app.prep_feedback),('advanced',app.advanced_feedback)):v.trace_add('write',lambda *args,k=k,v=v:self.notice_changed(k,v))
         s=min(.72,(app.root.winfo_screenwidth()-100)/1320,(app.root.winfo_screenheight()-130)/1758)
         app.root.geometry(f'{round(1320*s)}x{round(1758*s)}');app.root.minsize(round(1320*min(s,.42)),round(1758*min(s,.42)));app.root.resizable(True,True);self.schedule()
+        try:place_on_golden_line(app.root)
+        except Exception:pass   # placement is cosmetic; never block startup
 
     @staticmethod
     def pixel(im,x,y):return im.getpixel((x-60,y-81))

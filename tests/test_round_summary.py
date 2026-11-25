@@ -121,6 +121,39 @@ class RoundSummaryTests(unittest.TestCase):
         self.assertEqual([s['outcome'] for s in out if s],['游戏已关闭（暂停判断期间）','手动停止'])
         self.assertTrue(out[-1]['after_game_restart'])
 
+    def menu_round(self,countdown_at,countdown,menu_at):
+        """Countdown read, focus away, then the game log reports the menu (2026-11-25 04:35)."""
+        t=lambda s:T0+int(s*S)
+        ev=[(t(0),'armed',{})]
+        if countdown is not None:
+            ev.append((t(countdown_at),'center_extraction_countdown',dict(value=countdown,frame_wall_ns=t(countdown_at))))
+        ev+=[(t(menu_at),'zone_standby_started',dict(reason='raid_log_menu',menu_score=None)),
+             (t(menu_at+90),'armed',{})]
+        out=self.run_events(ev,extra_after=0)
+        return out[0]
+
+    def test_menu_after_countdown_reached_zero_is_extraction(self):
+        s=self.menu_round(100,2.2,108.2)   # 2.2 s left at 100 s, menu 6 s after the expected zero
+        self.assertEqual(s['outcome'],'撤离（游戏日志确认回到菜单）')
+        self.assertIn('2.2',s['extraction_basis'])
+        self.assertEqual(s['end_time'][11:19],RS._local(T0+int(108.2*S))[11:19])
+
+    def test_menu_well_before_zero_is_not_called_extraction(self):
+        s=self.menu_round(100,8.0,103)     # menu 5 s before the countdown could have ended
+        self.assertEqual(s['outcome'],'本局已结束（游戏日志回到菜单，画面未判定死亡或撤离）')
+        self.assertIsNone(s['extraction_basis'])
+
+    def test_menu_without_any_countdown_is_not_called_extraction(self):
+        s=self.menu_round(0,None,300)
+        self.assertEqual(s['outcome'],'本局已结束（游戏日志回到菜单，画面未判定死亡或撤离）')
+
+    def test_menu_after_a_judged_death_keeps_death(self):
+        rs=RoundSummary(T0,0);out=[]
+        for wall,kind,d in death_round():out+=rs.observe(kind,d,wall)
+        out+=rs.observe('zone_standby_started',dict(reason='raid_log_menu'),T0+105*S)
+        out+=[rs.due(T0+130*S)]
+        self.assertEqual([s['outcome'] for s in out if s],['死亡'])
+
     def test_program_exit_writes_immediately(self):
         rs=RoundSummary(T0,0)
         rs.observe('armed',{},T0)

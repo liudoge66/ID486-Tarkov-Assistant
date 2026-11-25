@@ -14,6 +14,8 @@ import re, threading, time
 
 WAIT_AFTER_END = 10.     # longest wait for exit / network confirmations after a death exit
 SETTLE = 1.5             # extra wait after the last expected confirmation (late audit records, end request)
+MENU_ZERO_EARLY = .5     # raid-log menu at most this long before the last countdown's expected zero ...
+MENU_ZERO_LATE = 60.     # ... and at most this long after it (loading / summary screens delay the log)
 RESPONSE_WAIT = 3.       # one extra wait when the game log has the end request but not yet its response
 REQUEST_AFTER_END = 3.   # an end request logged later than this after the round ended belongs to something else
 RESPONSE_LIMIT = 10.     # responses are looked for up to this long after the round ended
@@ -173,6 +175,21 @@ class RoundSummary:
             r['decision'] = wall; r['zone_remaining_s'] = d.get('remaining_s'); r['end'] = wall
         elif kind == 'zone_game_exited':
             r['outcome'] = '游戏已关闭（暂停判断期间）'; r['end'] = wall; self.after_restart = True
+        elif kind == 'center_extraction_countdown':
+            v = d.get('value')
+            if isinstance(v, (int, float)): r['last_countdown'] = (float(v), d.get('frame_wall_ns') or wall)
+        elif kind == 'zone_standby_started' and d.get('reason') == 'raid_log_menu' and 'outcome' not in r:
+            # The game log says the raid is over and the game is back at the menu, with no death or
+            # extraction judged on screen (e.g. focus was away for the last seconds of a countdown).
+            # Call it an extraction only if a countdown read in this round should have reached zero
+            # before the menu came back; the game log alone does not say extraction or death.
+            lc = r.get('last_countdown'); r['end'] = wall; r['decision'] = wall
+            zero = None if lc is None else lc[1] + int(lc[0] * 1e9)
+            if zero is not None and zero - int(MENU_ZERO_EARLY * 1e9) <= wall <= zero + int(MENU_ZERO_LATE * 1e9):
+                r['outcome'] = '撤离（游戏日志确认回到菜单）'
+                r['extraction_basis'] = f'倒计时 {lc[0]:.1f} 秒读数预计已归零，随后游戏日志回到菜单'
+            else:
+                r['outcome'] = '本局已结束（游戏日志回到菜单，画面未判定死亡或撤离）'
         elif kind == 'transfer_loading': r['transfers'] += 1
         elif kind == 'zone_entered': r['zone_pauses'] += 1
         self._common(r, kind, d, wall)

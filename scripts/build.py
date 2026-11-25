@@ -1,4 +1,4 @@
-"""Build V0.31 live-only Windows release. Run in a venv from requirements-build.txt."""
+"""Build V0.32 live-only Windows release. Run in a venv from requirements-build.txt."""
 import argparse
 import hashlib
 import os
@@ -31,7 +31,7 @@ def main():
         if item.is_file() and item.name not in omit:
             target=assets/item.relative_to(source/'assets');target.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(item,target)
     version=root/'scripts/version_info.txt'
-    spec=work/'ID486-V0.31.spec'
+    spec=work/'ID486-V0.32.spec'
     spec.write_text(f"""from PyInstaller.utils.hooks import collect_all
 datas = {[(str(assets),'assets')]!r}
 binaries = []

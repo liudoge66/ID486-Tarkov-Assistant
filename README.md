@@ -4,16 +4,16 @@
 
 <img src="docs/images/logo.png" width="112" height="112" alt="ID486 软件图标">
 
-### V0.31 · 观察画面，自动响应
+### V0.32 · 观察画面，自动响应
 
 适用于本地PvE战局的一个大退(Alt F4)小工具
 
-![Version](https://img.shields.io/badge/version-0.31-8b7cf8?style=flat-square)
+![Version](https://img.shields.io/badge/version-0.32-8b7cf8?style=flat-square)
 ![Platform](https://img.shields.io/badge/platform-Windows_x64-0078D4?style=flat-square)
 ![Capture](https://img.shields.io/badge/capture-SDR_%2F_HDR-38bdf8?style=flat-square)
 ![Mode](https://img.shields.io/badge/mode-local_PvE-34d399?style=flat-square)
 
-**[下载 V0.31](https://github.com/liudoge66/ID486-Tarkov-Assistant/releases/tag/v0.31)** · [快速使用](#快速使用) · [场景处理](#不同场景如何处理) · [技术方案](#当前技术方案) · [更新记录](docs/CHANGELOG.md)
+**[下载 V0.32](https://github.com/liudoge66/ID486-Tarkov-Assistant/releases/tag/v0.32)** · [快速使用](#快速使用) · [场景处理](#不同场景如何处理) · [技术方案](#当前技术方案) · [更新记录](docs/CHANGELOG.md)
 
 </div>
 
@@ -21,7 +21,7 @@
 
 进入战局、HUD 可见时按 **F10** 开始监控。助手结合 HUD、菜单、场景变化和可选的游戏日志线索判断状态；确认死亡后请求结束已核验的游戏进程，开启联网保险时并行隔离游戏及已核验的 UU 进程。正常撤离则停止监控并解除隔离。
 
-V0.31 在 V0.3 基础上改进撤离识别、加入灯塔商人区域保护、游戏关闭后自动续接，并为每局写出结束汇总。仍为一个统一版本，**发行版不含录像测试及 PyAV/FFmpeg 专用依赖**。
+V0.32 适配塔科夫 1.3.5，修复打开背包时误判大退；V0.31 起改进撤离识别、加入灯塔商人区域保护、游戏关闭后自动续接，并为每局写出结束汇总。仍为一个统一版本，**发行版不含录像测试及 PyAV/FFmpeg 专用依赖**。
 
 ## 使用前先确认
 
@@ -33,7 +33,7 @@ V0.31 在 V0.3 基础上改进撤离识别、加入灯塔商人区域保护、�
 - 使用中文界面及已验证的 HUD 布局；不同语言、UI 缩放、分辨率和未知叠加层需要自行确认。4K HDR 已有本机实测，21:9 等布局的适配不代表所有显示组合均已验证。
 
 <p align="center">
-  <img src="docs/images/interface-dark.png" width="360" alt="V0.31 深色界面">
+  <img src="docs/images/interface-dark.png" width="360" alt="深色界面">
 </p>
 
 ### UU 加速器设置
@@ -49,7 +49,7 @@ V0.31 在 V0.3 基础上改进撤离识别、加入灯塔商人区域保护、�
 
 ## 快速使用
 
-1. 从 [Releases](https://github.com/liudoge66/ID486-Tarkov-Assistant/releases/tag/v0.31) 下载 **ID486-V0.31-Windows.zip**，解压到可写目录，运行 **ID486模拟助手.exe**。无需安装 Python。
+1. 从 [Releases](https://github.com/liudoge66/ID486-Tarkov-Assistant/releases/tag/v0.32) 下载 **ID486-V0.32-Windows.zip**，解压到可写目录，运行 **ID486模拟助手.exe**。无需安装 Python。
 2. 新用户默认进入演练模式。先关闭联网保险，在战斗 HUD 可见时按 **F10**，确认菜单、背包及撤离的处理符合预期。
 3. 需要实际大退时关闭演练模式；需要联网保险时另行开启对应开关，并完成管理员授权。开关开启只是允许保险，按快捷键启动本轮监控后才进入待命。
 4. 再按一次快捷键停止。死亡触发或正常撤离停机后，下一轮请在 HUD 可见时重新开启。
@@ -119,7 +119,7 @@ V0.31 的判断逻辑在本机连续实战测试中，26 局里 8 次死亡全�
 
 ## 本地数据与升级
 
-- 在程序旁 **`数据`** 中保存设置、音效和日志；目录不可写时回退到 `%LOCALAPPDATA%\TarkovHUDMonitor\V0.3`（V0.31 沿用同一目录，升级后设置与日志不变）。
+- 在程序旁 **`数据`** 中保存设置、音效和日志；目录不可写时回退到 `%LOCALAPPDATA%\TarkovHUDMonitor\V0.3`（V0.31、V0.32 沿用同一目录，升级后设置与日志不变）。
 - 默认关闭截图收集与详细性能日志，不自动上传用户数据。诊断可能包含游戏画面、路径、进程信息和监控期间的按键记录，分享前请检查。
 - 从旧版升级时，若新数据目录尚无设置，会尝试迁移同目录的 `PMC数据`、`Fence数据` 或旧版根目录设置。建议保留旧目录备份，确认升级后再整理。
 - 发布 ZIP 不包含私人设置、历史日志、诊断截图、录像或自定义音频；完整性见附件 **SHA256SUMS.txt**。

@@ -5,7 +5,7 @@ from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1]
 OUT=ROOT/'dist'
 temporary=tempfile.TemporaryDirectory(prefix='id486-clean-release-')
-PACKAGE=Path(temporary.name)/'ID486-V0.31-Windows'
+PACKAGE=Path(temporary.name)/'ID486-V0.32-Windows'
 PACKAGE.mkdir(parents=True,exist_ok=True)
 shutil.copy2(OUT/'ID486模拟助手.exe',PACKAGE/'ID486模拟助手.exe')
 for name in ('README.md',):
@@ -13,7 +13,7 @@ for name in ('README.md',):
 for folder in ('docs',):
     shutil.copytree(ROOT/folder,PACKAGE/folder,dirs_exist_ok=True)
 shutil.copytree(ROOT/'src/assets/capture',PACKAGE/'capture-licenses',ignore=shutil.ignore_patterns('*.dll'),dirs_exist_ok=True)
-archive=OUT/'ID486-V0.31-Windows.zip'
+archive=OUT/'ID486-V0.32-Windows.zip'
 with zipfile.ZipFile(archive,'w',zipfile.ZIP_DEFLATED,compresslevel=9) as z:
     for p in sorted(PACKAGE.rglob('*')):
         if p.is_file():z.write(p,PACKAGE.name+'/'+p.relative_to(PACKAGE).as_posix())
